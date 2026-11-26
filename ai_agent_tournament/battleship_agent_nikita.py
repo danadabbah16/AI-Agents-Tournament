@@ -1,13 +1,16 @@
 """Battleship agent: per-ship HMM filter for unhit ships, exact hypothesis tracking for hit ships,
 Bayesian sonar, model averaging over placement styles, shadow-opponent model for hiding moves."""
 import random
+import sys
 import time
+import traceback
 
 import numpy as np
 
 DIRS = {"N": (-1, 0), "S": (1, 0), "E": (0, 1), "W": (0, -1)}
+OPPOSITE = {"N": "S", "S": "N", "E": "W", "W": "E"}
 MOVE_RATE = 0.05
-SHADOW_RATES = (1.0,)
+SHADOW_MODELS = ((0.0, 1.0, 0.7), (-1.5, 1.0, 0.3))
 HYP_CAP = 300
 PLACE_TRIES = 3
 EDGE_RISK = 1.0
@@ -16,6 +19,7 @@ MODEL_PRUNE = 0.02
 SONAR_TRIGGER = 0.2
 SONAR_GAIN = 1.5
 RISK_POWER = 3
+REVERSE_PENALTY = 1e-3
 TIME_RESERVE = 0.6
 TIME_SAFETY = 3.0
 POOR_TURN = 0.008
@@ -174,14 +178,31 @@ class Belief:
             self.info[key] = (owner, tuple(nv[L] for L in self.lengths), mask)
         return self.info[key]
 
+    def _active_lengths(self):
+        active = [False] * len(self.lengths)
+        for k in self.hyps:
+            nv = self._hyp(k)[1]
+            for i, c in enumerate(nv):
+                if c > 0:
+                    active[i] = True
+        return active
+
     def coverage(self):
         """Per length: probability that an unhit ship of that length covers each cell."""
-        return {L: _coverage(self.u[L]["H"], L, "H") + _coverage(self.u[L]["V"], L, "V") for L in self.lengths}
+        active = self._active_lengths()
+        zeros = np.zeros((self.n, self.n))
+        return {
+            L: (_coverage(self.u[L]["H"], L, "H") + _coverage(self.u[L]["V"], L, "V")) if active[i] else zeros
+            for i, L in enumerate(self.lengths)
+        }
 
     def predict(self):
         mobile = sum(w * sum(self._hyp(k)[1]) for k, w in self.hyps.items())
         q = min(1.0, self.move_rate / max(1.0, mobile))
-        for L in self.lengths:
+        active = self._active_lengths()
+        for i, L in enumerate(self.lengths):
+            if not active[i]:
+                continue
             for o in "HV":
                 self.u[L][o] = predict_ship_belief(self.u[L][o], L, o, q) * self.allowed[L][o]
             self._normalize(L)
@@ -369,16 +390,18 @@ class Agent:
         lengths = [L for _, L in self.fleet]
         self.models = [Belief(self.n, lengths, MOVE_RATE, bias, touch) for bias, touch, _ in PRIOR_MODELS]
         self.model_w = np.array([w for _, _, w in PRIOR_MODELS])
-        self.shadows = [Belief(self.n, lengths, rate) for rate in SHADOW_RATES]
+        self.shadows = [Belief(self.n, lengths, rate, bias) for bias, rate, _ in SHADOW_MODELS]
+        self.shadow_w = np.array([w for _, _, w in SHADOW_MODELS])
         self.edge_weight = 1.0 + EDGE_RISK * (_depth(self.n) == 0)
         self.done_actions = 0
         self.done_damage = 0
         self.seen_turn = None
+        self.last_move = None
         self.started = False
         self.turn_cost = 0.02
 
     def placement(self):
-        density = self.shadows[0].cell_probs()
+        density = self.shadows[0].cell_probs() * self.edge_weight
         best, best_score = None, None
         for _ in range(PLACE_TRIES):
             layout = self._random_layout()
@@ -446,6 +469,12 @@ class Agent:
             real = [d for d in damage[self.done_damage:] if d["turn"] == opp_turn]
             if real:
                 self.done_damage += 1
+                d = real[0]
+                cell = tuple(d["cell"])
+                lik = np.array([min(max(float(s.cell_probs()[cell]), 1e-6), 1 - 1e-6) for s in self.shadows])
+                w = self.shadow_w * lik
+                if w.sum() > 0:
+                    self.shadow_w = w / w.sum()
             for shadow in self.shadows:
                 if real:
                     d = real[0]
@@ -461,13 +490,16 @@ class Agent:
         moves = obs["legal_moves"]
         if not moves:
             return None
-        risk = sum(np.clip(s.cell_probs(), 0, None) ** RISK_POWER for s in self.shadows) * self.edge_weight
+        risk = sum(w * (np.clip(s.cell_probs(), 0, None) ** RISK_POWER)
+                   for w, s in zip(self.shadow_w, self.shadows)) * self.edge_weight
         ships = {s["ship"]: s for s in obs["my_ships"]}
         best, best_delta = None, -1e-12
         for mv in moves:
             dr, dc = DIRS[mv["direction"]]
             old = [tuple(c) for c in ships[mv["ship"]]["cells"]]
             delta = sum(risk[r + dr, c + dc] for r, c in old) - sum(risk[c] for c in old)
+            if self.last_move and mv["ship"] == self.last_move[0] and mv["direction"] == OPPOSITE[self.last_move[1]]:
+                delta += REVERSE_PENALTY
             if delta < best_delta:
                 best, best_delta = mv, delta
         return {"ship": best["ship"], "direction": best["direction"]} if best else None
@@ -523,6 +555,9 @@ class Agent:
             move = self._hide(obs)
             if move:
                 action["move"] = move
+                self.last_move = (move["ship"], move["direction"])
+            else:
+                self.last_move = None
         center = self._sonar_choice(obs, p, best_p) if rich else None
         if center is not None:
             action["sonar"] = [int(center[0]), int(center[1])]
@@ -538,9 +573,24 @@ class Agent:
 _AGENT = None
 
 
+def _fallback_shot(observation):
+    """Random cell not shot yet, so an internal error costs one weak turn instead of the game."""
+    n = observation["board_size"]
+    shot = {tuple(s["target"]) for s in observation["my_shots"]}
+    open_cells = [(r, c) for r in range(n) for c in range(n) if (r, c) not in shot]
+    r, c = random.choice(open_cells or [(0, 0)])
+    return {"shot": [r, c]}
+
+
 def act(observation):
     global _AGENT
-    if observation["phase"] == "placement":
-        _AGENT = Agent(observation)
-        return _AGENT.placement()
-    return _AGENT.act(observation)
+    try:
+        if observation["phase"] == "placement":
+            _AGENT = Agent(observation)
+            return _AGENT.placement()
+        return _AGENT.act(observation)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        if observation["phase"] == "placement":
+            return {"placements": None}
+        return _fallback_shot(observation)
