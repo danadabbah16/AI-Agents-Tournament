@@ -1,9 +1,9 @@
-"""Chess agent: PeSTO evaluation searched by alpha-beta over python-chess.
+"""Chess agent: PeSTO evaluation searched by two cores inside one file.
 
 Started from: student_templates/chess_agent.py
 Rules: games/chess/README.md
-Core A searches python-chess boards directly. The Core B mailbox board below is
-built and tested here; act() does not use it yet.
+Core A searches python-chess boards and is always available. Core B is a
+faster 10x12 mailbox engine, used only while it agrees with python-chess.
 """
 import math
 import random
@@ -37,9 +37,17 @@ MATE_BOUND = 29000
 INFINITY_SCORE = 32000
 MAX_PLY = 64
 MAX_SEARCH_DEPTH = 32
+ASPIRATION_WINDOW = 40
+ASPIRATION_MAX_DELTA = 500
+RFP_MARGIN_PER_DEPTH = 120
+RFP_MAX_DEPTH = 3
+FUTILITY_MARGINS = [0, 200, 400]
+NULL_MOVE_MIN_DEPTH = 3
 DELTA_MARGIN = 200
 BIG_DELTA = 975
 DELTA_ENDGAME_PHASE = 4
+LMR_MIN_DEPTH = 3
+LMR_MIN_MOVE_INDEX = 4
 HISTORY_MAX = 400000
 TT_MAX_ENTRIES = 200000
 TT_EXACT = 0
@@ -371,6 +379,22 @@ def build_zobrist_keys() -> tuple:
 
 ZOBRIST_PIECES, ZOBRIST_CASTLING, ZOBRIST_EP_FILES, ZOBRIST_SIDE = build_zobrist_keys()
 
+
+def build_lmr_table() -> list:
+    """Build the late-move-reduction table indexed by depth and move index."""
+    table = []
+    for depth in range(64):
+        row = []
+        for move_index in range(64):
+            if depth == 0 or move_index == 0:
+                row.append(0)
+            else:
+                row.append(int(0.7844 + math.log(depth) * math.log(move_index) / 2.4696))
+        table.append(row)
+    return table
+
+
+LMR_TABLE = build_lmr_table()
 
 BOOK_LINES = [
     ("e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 "
@@ -1396,6 +1420,424 @@ def decode_chess_move(code: int) -> chess.Move:
     return chess.Move(code & 63, (code >> 6) & 63, promotion)
 
 
+class MailboxEngine:
+    """Core B search: PVS with TT, pruning and reductions over a MailboxBoard."""
+
+    def __init__(self, board: MailboxBoard) -> None:
+        """Attach the engine to the mailbox it searches."""
+        self.board = board
+        self.tt = {}
+        self.killers = new_killer_table()
+        self.history = [0] * (2 * 14400)
+        self.nodes = 0
+        self.hard_deadline = 0.0
+        self.contempt = 0
+        self.age = 0
+        self.iteration_move = 0
+        self.fail_high_move = 0
+        self.completed_best_uci = None
+        self.last_depth = 0
+
+    def prepare_search(self) -> None:
+        """Age the tables once per move."""
+        self.age += 1
+        self.nodes = 0
+        self.killers = new_killer_table()
+        halve_history(self.history)
+        self.tt = trim_tt(self.tt)
+        self.completed_best_uci = None
+
+    def draw_score(self, ply: int) -> int:
+        """Return the draw score for the side to move at this ply."""
+        if ply & 1:
+            return self.contempt
+        return -self.contempt
+
+    def order_moves(self, moves: list, tt_move: int, ply: int) -> list:
+        """Return the moves as packed sort keys, best first."""
+        squares = self.board.squares
+        side = self.board.side
+        killers = self.killers[ply]
+        first_killer = killers[0]
+        second_killer = killers[1]
+        history = self.history
+        history_base = side * 14400
+        if side == WHITE_SIDE:
+            enemy_pawn = BLACK_PAWN
+            pawn_offset_one = 9
+            pawn_offset_two = 11
+        else:
+            enemy_pawn = WHITE_PAWN
+            pawn_offset_one = -9
+            pawn_offset_two = -11
+        keyed = []
+        for move in moves:
+            if move == tt_move:
+                score = TT_MOVE_SCORE
+            else:
+                flag = move >> FLAG_SHIFT
+                to_square = (move >> TO_SHIFT) & SQUARE_MASK
+                if flag & FLAG_PROMOTION:
+                    if (flag & 3) == 3:
+                        score = QUEEN_PROMOTION_SCORE + SEE_VALUES[squares[to_square] & 7]
+                    else:
+                        score = 0
+                elif flag & FLAG_CAPTURE:
+                    attacker = squares[move & SQUARE_MASK] & 7
+                    if flag == FLAG_EN_PASSANT:
+                        victim = PAWN
+                    else:
+                        victim = squares[to_square] & 7
+                    mvv_lva = 10 * victim - attacker
+                    # A pawn-defended victim worth less than the attacker is a cheap SEE stand-in.
+                    if SEE_VALUES[attacker] > SEE_VALUES[victim] and (
+                            squares[to_square + pawn_offset_one] == enemy_pawn
+                            or squares[to_square + pawn_offset_two] == enemy_pawn):
+                        score = LOSING_CAPTURE_SCORE + mvv_lva
+                    else:
+                        score = GOOD_CAPTURE_SCORE + mvv_lva
+                elif move == first_killer:
+                    score = FIRST_KILLER_SCORE
+                elif move == second_killer:
+                    score = SECOND_KILLER_SCORE
+                else:
+                    score = history[history_base + (move & SQUARE_MASK) * 120 + to_square]
+            # Packing the score above the move lets one plain sort order the list.
+            keyed.append((score << 18) | move)
+        keyed.sort(reverse=True)
+        return keyed
+
+    def record_quiet_cutoff(self, move: int, ply: int, depth: int, side: int) -> None:
+        """Update killers and history after a quiet move caused a cutoff."""
+        killers = self.killers[ply]
+        if killers[0] != move:
+            killers[1] = killers[0]
+            killers[0] = move
+        index = side * 14400 + (move & SQUARE_MASK) * 120 + ((move >> TO_SHIFT) & SQUARE_MASK)
+        self.history[index] += depth * depth
+        if self.history[index] > HISTORY_MAX:
+            halve_history(self.history)
+
+    def static_best_move(self) -> int:
+        """Return the legal move with the best one-ply static score, for instant play."""
+        board = self.board
+        best_move = 0
+        best_score = -INFINITY_SCORE
+        for move in board.legal_moves():
+            board.make_move(move)
+            score = -board.evaluate()
+            board.unmake_move()
+            if score > best_score:
+                best_score = score
+                best_move = move
+        return best_move
+
+    def think(self, soft_limit: float, hard_limit: float, depth_cap: int,
+              start_time: float) -> tuple:
+        """Iteratively deepen with aspiration windows; return (move, score, depth)."""
+        board = self.board
+        self.prepare_search()
+        self.hard_deadline = start_time + hard_limit
+        base_stack = len(board.undo_stack)
+        root_static = board.evaluate() - TEMPO_BONUS
+        self.contempt = compute_contempt(board.phase, root_static)
+        root_moves = board.legal_moves()
+        if not root_moves:
+            return 0, 0, 0
+        tt_move = 0
+        entry = self.tt.get(board.hash_value)
+        if entry is not None:
+            tt_move = entry & MOVE_MASK
+        ordered = []
+        for packed in self.order_moves(root_moves, tt_move, 0):
+            ordered.append(packed & MOVE_MASK)
+        best_move = ordered[0]
+        best_score = 0
+        completed_depth = 0
+        previous_score = None
+        score_dropped = False
+        for depth in range(1, depth_cap + 1):
+            elapsed = time.perf_counter() - start_time
+            # A score drop buys extra time, but never past the hard deadline.
+            limit = hard_limit if score_dropped else soft_limit
+            if depth > 1 and elapsed > ITERATION_START_FRACTION * limit:
+                break
+            self.iteration_move = 0
+            self.fail_high_move = 0
+            delta = ASPIRATION_WINDOW
+            if depth >= 4 and abs(best_score) < MATE_BOUND:
+                alpha = best_score - delta
+                beta = best_score + delta
+            else:
+                alpha = -INFINITY_SCORE
+                beta = INFINITY_SCORE
+            aborted = False
+            score = 0
+            move = best_move
+            while True:
+                try:
+                    score, move = self.search_root_moves(ordered, depth, alpha, beta)
+                except SearchTimeout:
+                    board.undo_to(base_stack)
+                    aborted = True
+                    break
+                if score <= alpha and alpha > -INFINITY_SCORE:
+                    alpha -= delta
+                    delta *= 2
+                    if delta > ASPIRATION_MAX_DELTA:
+                        alpha = -INFINITY_SCORE
+                        beta = INFINITY_SCORE
+                    continue
+                if score >= beta and beta < INFINITY_SCORE:
+                    beta += delta
+                    delta *= 2
+                    if delta > ASPIRATION_MAX_DELTA:
+                        alpha = -INFINITY_SCORE
+                        beta = INFINITY_SCORE
+                    continue
+                break
+            if aborted:
+                if self.iteration_move:
+                    best_move = self.iteration_move
+                elif self.fail_high_move:
+                    best_move = self.fail_high_move
+                break
+            score_dropped = (previous_score is not None
+                             and score <= previous_score - SCORE_DROP_MARGIN)
+            previous_score = score
+            best_score = score
+            best_move = move
+            completed_depth = depth
+            self.completed_best_uci = move_to_uci(move)
+            store_tt_entry(self.tt, board.hash_value, move, TT_EXACT, depth, self.age, score, 0)
+            ordered = [best_move]
+            for packed in self.order_moves(root_moves, best_move, 0):
+                if (packed & MOVE_MASK) != best_move:
+                    ordered.append(packed & MOVE_MASK)
+            if abs(score) >= MATE_BOUND and MATE_VALUE - abs(score) <= depth:
+                break
+        self.last_depth = completed_depth
+        return best_move, best_score, completed_depth
+
+    def search_root_moves(self, ordered: list, depth: int, alpha: int, beta: int) -> tuple:
+        """Search every root move once with PVS; return (best score, best move)."""
+        board = self.board
+        mover = board.side
+        enemy = mover ^ 1
+        best_score = -INFINITY_SCORE
+        best_move = ordered[0]
+        first = True
+        for move in ordered:
+            board.make_move(move)
+            gives_check = board.is_attacked(board.king_squares[enemy], mover)
+            if first:
+                score = -self.search_node(depth - 1, -beta, -alpha, 1, gives_check, True)
+                first = False
+            else:
+                score = -self.search_node(depth - 1, -alpha - 1, -alpha, 1, gives_check, True)
+                if alpha < score < beta:
+                    score = -self.search_node(depth - 1, -beta, -alpha, 1, gives_check, True)
+            board.unmake_move()
+            if score > best_score:
+                best_score = score
+                best_move = move
+            if score > alpha:
+                alpha = score
+                self.iteration_move = move
+                if score >= beta:
+                    self.fail_high_move = move
+                    break
+        return best_score, best_move
+
+    def search_node(self, depth: int, alpha: int, beta: int, ply: int, in_check: bool,
+                    null_allowed: bool) -> int:
+        """Principal variation search; returns a fail-soft score for the side to move."""
+        self.nodes += 1
+        if (self.nodes & TIME_CHECK_MASK) == 0 and time.perf_counter() > self.hard_deadline:
+            raise SearchTimeout()
+        board = self.board
+        pv_node = beta - alpha > 1
+        if board.halfmove >= 100 or board.is_repetition() or board.is_insufficient_material():
+            return self.draw_score(ply)
+        if ply >= MAX_PLY:
+            return board.evaluate()
+        mate_alpha = ply - MATE_VALUE
+        if alpha < mate_alpha:
+            alpha = mate_alpha
+        mate_beta = MATE_VALUE - ply - 1
+        if beta > mate_beta:
+            beta = mate_beta
+        if alpha >= beta:
+            return alpha
+        if in_check:
+            depth += 1
+        if depth <= 0:
+            return self.quiescence(alpha, beta, ply, in_check)
+        hash_value = board.hash_value
+        tt_move = 0
+        entry = self.tt.get(hash_value)
+        if entry is not None:
+            tt_move = entry & MOVE_MASK
+            if not pv_node:
+                tt_score = probe_tt_score(entry, depth, alpha, beta, ply)
+                if tt_score is not None:
+                    return tt_score
+        static_eval = 0
+        futility = False
+        if not in_check:
+            static_eval = board.evaluate()
+            if not pv_node:
+                if (depth <= RFP_MAX_DEPTH and -MATE_BOUND < beta < MATE_BOUND
+                        and static_eval - RFP_MARGIN_PER_DEPTH * depth >= beta):
+                    return static_eval
+                if (null_allowed and depth >= NULL_MOVE_MIN_DEPTH and static_eval >= beta
+                        and board.has_non_pawn_material()):
+                    reduction = 3 if depth >= 6 else 2
+                    board.make_null_move()
+                    score = -self.search_node(depth - 1 - reduction, -beta, 1 - beta, ply + 1,
+                                              False, False)
+                    board.unmake_move()
+                    if score >= beta:
+                        # A mate found after passing is not trustworthy.
+                        if score >= MATE_BOUND:
+                            return beta
+                        return score
+                if depth <= 2 and static_eval + FUTILITY_MARGINS[depth] <= alpha:
+                    futility = True
+        mover = board.side
+        enemy = mover ^ 1
+        king_squares = board.king_squares
+        killers = self.killers[ply]
+        original_alpha = alpha
+        best_score = -INFINITY_SCORE
+        best_move = 0
+        legal_count = 0
+        for packed in self.order_moves(board.generate_moves(False), tt_move, ply):
+            move = packed & MOVE_MASK
+            board.make_move(move)
+            if board.is_attacked(king_squares[mover], enemy):
+                board.unmake_move()
+                continue
+            legal_count += 1
+            gives_check = board.is_attacked(king_squares[enemy], mover)
+            quiet = ((move >> FLAG_SHIFT) & 12) == 0
+            if futility and quiet and not gives_check and legal_count > 1:
+                board.unmake_move()
+                continue
+            if legal_count == 1:
+                score = -self.search_node(depth - 1, -beta, -alpha, ply + 1, gives_check, True)
+            else:
+                reduction = 0
+                if (depth >= LMR_MIN_DEPTH and legal_count > LMR_MIN_MOVE_INDEX and quiet
+                        and not in_check and not gives_check
+                        and move != killers[0] and move != killers[1]):
+                    reduction = LMR_TABLE[min(depth, 63)][min(legal_count - 1, 63)]
+                    if pv_node:
+                        reduction -= 1
+                    if reduction > depth - 2:
+                        reduction = depth - 2
+                    if reduction < 0:
+                        reduction = 0
+                score = -self.search_node(depth - 1 - reduction, -alpha - 1, -alpha, ply + 1,
+                                          gives_check, True)
+                if reduction > 0 and score > alpha:
+                    score = -self.search_node(depth - 1, -alpha - 1, -alpha, ply + 1,
+                                              gives_check, True)
+                if alpha < score < beta:
+                    score = -self.search_node(depth - 1, -beta, -alpha, ply + 1, gives_check, True)
+            board.unmake_move()
+            if score > best_score:
+                best_score = score
+                best_move = move
+                if score > alpha:
+                    alpha = score
+                    if score >= beta:
+                        if quiet:
+                            self.record_quiet_cutoff(move, ply, depth, mover)
+                        break
+        if legal_count == 0:
+            if in_check:
+                return ply - MATE_VALUE
+            return self.draw_score(ply)
+        if best_score == -INFINITY_SCORE:
+            return static_eval
+        if best_score >= beta:
+            flag = TT_LOWER
+        elif best_score > original_alpha:
+            flag = TT_EXACT
+        else:
+            flag = TT_UPPER
+        store_tt_entry(self.tt, hash_value, best_move, flag, depth, self.age, best_score, ply)
+        return best_score
+
+    def quiescence(self, alpha: int, beta: int, ply: int, in_check: bool) -> int:
+        """Search captures and queen promotions until the position is quiet."""
+        self.nodes += 1
+        if (self.nodes & TIME_CHECK_MASK) == 0 and time.perf_counter() > self.hard_deadline:
+            raise SearchTimeout()
+        board = self.board
+        mover = board.side
+        enemy = mover ^ 1
+        king_squares = board.king_squares
+        if in_check:
+            best_score = -INFINITY_SCORE
+            legal_count = 0
+            for packed in self.order_moves(board.generate_moves(False), 0, ply):
+                move = packed & MOVE_MASK
+                board.make_move(move)
+                if board.is_attacked(king_squares[mover], enemy):
+                    board.unmake_move()
+                    continue
+                legal_count += 1
+                score = -self.quiescence(-beta, -alpha, ply + 1, False)
+                board.unmake_move()
+                if score > best_score:
+                    best_score = score
+                    if score > alpha:
+                        alpha = score
+                        if score >= beta:
+                            break
+            if legal_count == 0:
+                return ply - MATE_VALUE
+            return best_score
+        stand_pat = board.evaluate()
+        if stand_pat >= beta or ply >= MAX_PLY:
+            return stand_pat
+        use_delta = board.phase > DELTA_ENDGAME_PHASE
+        if use_delta and stand_pat + BIG_DELTA < alpha:
+            return stand_pat
+        if stand_pat > alpha:
+            alpha = stand_pat
+        best_score = stand_pat
+        captures = board.generate_moves(True)
+        if not captures:
+            return stand_pat
+        squares = board.squares
+        for packed in self.order_moves(captures, 0, ply):
+            move = packed & MOVE_MASK
+            flag = move >> FLAG_SHIFT
+            if use_delta and not (flag & FLAG_PROMOTION):
+                if flag == FLAG_EN_PASSANT:
+                    victim_value = EG_VALUES[PAWN]
+                else:
+                    victim_value = EG_VALUES[squares[(move >> TO_SHIFT) & SQUARE_MASK] & 7]
+                if stand_pat + victim_value + DELTA_MARGIN <= alpha:
+                    continue
+            board.make_move(move)
+            if board.is_attacked(king_squares[mover], enemy):
+                board.unmake_move()
+                continue
+            score = -self.quiescence(-beta, -alpha, ply + 1, False)
+            board.unmake_move()
+            if score > best_score:
+                best_score = score
+                if score > alpha:
+                    alpha = score
+                    if score >= beta:
+                        break
+        return best_score
+
+
 class PythonChessEngine:
     """Core A search: alpha-beta PVS over python-chess boards, correct by construction."""
 
@@ -1798,8 +2240,11 @@ class GameState:
         self.known_history = []
         self.board = chess.Board()
         self.position_keys = [position_key(self.board)]
+        self.mailbox = MailboxBoard()
+        self.core_b_enabled = True
         self.book_active = True
         self.engine_a = PythonChessEngine()
+        self.engine_b = MailboxEngine(self.mailbox)
 
     def load_from_fen(self, fen: str, history: list) -> None:
         """Trust the FEN alone when the history cannot be replayed."""
@@ -1807,9 +2252,10 @@ class GameState:
         self.board = chess.Board(fen)
         self.position_keys = [position_key(self.board)]
         self.known_history = list(history)
+        self.mailbox.load_board(self.board)
 
     def sync(self, observation: dict) -> None:
-        """Bring the board up to date with the observation's history and FEN."""
+        """Bring both boards up to date with the observation's history and FEN."""
         history = list(observation.get("history") or [])
         fen = observation.get("fen") or chess.STARTING_FEN
         known_count = len(self.known_history)
@@ -1825,11 +2271,55 @@ class GameState:
                 break
             self.position_keys.append(position_key(self.board))
             self.known_history.append(uci)
+            if self.core_b_enabled:
+                try:
+                    self.mailbox.make_uci_move(uci)
+                except Exception as error:
+                    debug_print(f"Core B could not play {uci}: {error}")
         if not trusted or not fen_fields_match(self.board, fen):
             self.load_from_fen(fen, history)
+        if self.core_b_enabled:
+            self.verify_mailbox(history)
         side = "white" if self.board.turn == chess.WHITE else "black"
         if observation.get("color", side) != side:
             debug_print(f"FEN says {side} to move but we were told {observation.get('color')}")
+
+    def verify_mailbox(self, history: list) -> None:
+        """Rebuild Core B if it drifted from python-chess, and disable it if that fails."""
+        try:
+            if self.mailbox.matches(self.board):
+                return
+            debug_print("Core B drifted; replaying the history.")
+            self.mailbox.load_board(chess.Board())
+            for uci in history:
+                self.mailbox.make_uci_move(uci)
+            if self.mailbox.matches(self.board):
+                return
+        except Exception as error:
+            debug_print(f"Core B replay failed: {error}")
+        try:
+            self.mailbox.load_board(self.board)
+            if self.mailbox.matches(self.board):
+                return
+        except Exception as error:
+            debug_print(f"Core B could not load the FEN: {error}")
+        self.core_b_enabled = False
+
+    def core_b_root_matches(self, legal_moves: list) -> bool:
+        """Check Core B's root moves against the judge's list; disable it on mismatch."""
+        if not self.core_b_enabled:
+            return False
+        try:
+            generated = set()
+            for move in self.mailbox.legal_moves():
+                generated.add(move_to_uci(move))
+            if generated == set(legal_moves):
+                return True
+            debug_print(f"Core B move mismatch: {sorted(generated ^ set(legal_moves))}")
+        except Exception as error:
+            debug_print(f"Core B move generation failed: {error}")
+        self.core_b_enabled = False
+        return False
 
     def book_move(self, ply: int, legal_moves: list):
         """Return a weighted-random book move, or None once the game leaves the book."""
@@ -1847,19 +2337,33 @@ class GameState:
         return None
 
     def instant_move(self, legal_moves: list) -> str:
-        """Return the best capture with no search, for when the clock is nearly gone."""
+        """Return a move with no search at all, for when the clock is nearly gone."""
+        if self.core_b_enabled:
+            try:
+                uci = move_to_uci(self.engine_b.static_best_move())
+                if uci in legal_moves:
+                    return uci
+            except Exception as error:
+                debug_print(f"Instant move failed: {error}")
         return best_capture(self.board, legal_moves)
 
     def search_move(self, observation: dict, start_time: float, remaining: float) -> str:
-        """Run the time-managed Core A search."""
+        """Run the time-managed search with Core B if it is trusted, else Core A."""
+        legal_moves = observation["legal_moves"]
         ply = int(observation.get("ply", self.board.ply()))
         in_check = bool(observation.get("is_check", self.board.is_check()))
         soft_limit, hard_limit, depth_cap = compute_time_budget(remaining, ply, in_check)
-        engine = self.engine_a
-        move, score, depth = engine.think(self.board, self.position_keys, soft_limit,
-                                          hard_limit, depth_cap, start_time)
-        uci = move.uci() if move is not None else None
-        core_name = "A"
+        if self.core_b_root_matches(legal_moves):
+            engine = self.engine_b
+            move, score, depth = engine.think(soft_limit, hard_limit, depth_cap, start_time)
+            uci = move_to_uci(move) if move else None
+            core_name = "B"
+        else:
+            engine = self.engine_a
+            move, score, depth = engine.think(self.board, self.position_keys, soft_limit,
+                                              hard_limit, depth_cap, start_time)
+            uci = move.uci() if move is not None else None
+            core_name = "A"
         elapsed = time.perf_counter() - start_time
         nodes_per_second = int(engine.nodes / elapsed) if elapsed > 0 else 0
         debug_print(f"ply {ply} core {core_name} depth {depth} score {score} move {uci} "
@@ -1898,8 +2402,9 @@ def fallback_move(observation: dict) -> str:
     legal_moves = list(observation.get("legal_moves") or [])
     if not legal_moves:
         return "0000"
-    if STATE.engine_a.completed_best_uci in legal_moves:
-        return STATE.engine_a.completed_best_uci
+    for engine in (STATE.engine_b, STATE.engine_a):
+        if engine.completed_best_uci in legal_moves:
+            return engine.completed_best_uci
     try:
         board = chess.Board(observation["fen"])
         return best_capture(board, legal_moves)
@@ -1913,6 +2418,7 @@ def choose_move(observation: dict) -> str:
     start_time = time.perf_counter()
     legal_moves = observation["legal_moves"]
     STATE.engine_a.completed_best_uci = None
+    STATE.engine_b.completed_best_uci = None
     if len(legal_moves) == 1:
         return legal_moves[0]
     remaining = float(observation.get("time_remaining_s", DEFAULT_CLOCK_S))
