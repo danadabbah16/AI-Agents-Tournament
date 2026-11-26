@@ -2,8 +2,8 @@
 
 Started from: student_templates/chess_agent.py
 Rules: games/chess/README.md
-Core A searches python-chess boards directly, so every move it plays is legal by
-construction.
+Core A searches python-chess boards directly. The Core B mailbox board below is
+built and tested here; act() does not use it yet.
 """
 import math
 import random
@@ -64,6 +64,8 @@ SECOND_KILLER_SCORE = 1800000
 LOSING_CAPTURE_SCORE = 100000
 
 BOOK_MAX_PLY = 24
+ZOBRIST_SEED = 20261126
+
 BISHOP_PAIR_MG = 30
 BISHOP_PAIR_EG = 50
 FULL_PHASE = 24
@@ -78,16 +80,63 @@ MOP_UP_KING_WEIGHT = 16
 MOP_UP_CORNER_WEIGHT = 35
 MOP_UP_MAX_DISTANCE = 14
 
+EMPTY = 0
 PAWN = 1
 KNIGHT = 2
 BISHOP = 3
 ROOK = 4
 QUEEN = 5
 KING = 6
+WHITE_PAWN = 1
+WHITE_KNIGHT = 2
+WHITE_BISHOP = 3
+WHITE_ROOK = 4
+WHITE_QUEEN = 5
+WHITE_KING = 6
+BLACK_PAWN = 9
+BLACK_KNIGHT = 10
+BLACK_BISHOP = 11
+BLACK_ROOK = 12
+BLACK_QUEEN = 13
+BLACK_KING = 14
+OFF_BOARD = 32
 BLACK_OFFSET = 8
 PIECE_CODE_COUNT = 16
 
+WHITE_SIDE = 0
+BLACK_SIDE = 1
+
+FLAG_QUIET = 0
+FLAG_DOUBLE_PUSH = 1
+FLAG_KING_CASTLE = 2
+FLAG_QUEEN_CASTLE = 3
+FLAG_CAPTURE = 4
+FLAG_EN_PASSANT = 5
+FLAG_PROMOTION = 8
+FLAG_CAPTURE_PROMOTION = 12
+FLAG_QUEEN_PROMOTION = 11
+FLAG_QUEEN_CAPTURE_PROMOTION = 15
 MOVE_MASK = (1 << 18) - 1
+TO_SHIFT = 7
+FLAG_SHIFT = 14
+SQUARE_MASK = 127
+PROMOTION_LETTERS = "nbrq"
+
+CASTLE_WHITE_KING = 1
+CASTLE_WHITE_QUEEN = 2
+CASTLE_BLACK_KING = 4
+CASTLE_BLACK_QUEEN = 8
+
+KNIGHT_OFFSETS = (-21, -19, -12, -8, 8, 12, 19, 21)
+BISHOP_DIRECTIONS = (-11, -9, 9, 11)
+ROOK_DIRECTIONS = (-10, -1, 1, 10)
+KING_OFFSETS = (-11, -10, -9, -1, 1, 9, 10, 11)
+SLIDER_DIRECTIONS = {
+    BISHOP: BISHOP_DIRECTIONS,
+    ROOK: ROOK_DIRECTIONS,
+    QUEEN: KING_OFFSETS,
+}
+
 MG_VALUES = [0, 82, 337, 365, 477, 1025, 0]
 EG_VALUES = [0, 94, 281, 297, 512, 936, 0]
 PHASE_INCREMENTS = [0, 0, 1, 1, 2, 4, 0]
@@ -229,10 +278,27 @@ EG_TABLES = [None, EG_PAWN_TABLE, EG_KNIGHT_TABLE, EG_BISHOP_TABLE,
              EG_ROOK_TABLE, EG_QUEEN_TABLE, EG_KING_TABLE]
 
 
+def build_square_maps() -> tuple:
+    """Build the 64-to-120 and 120-to-64 square conversion tables."""
+    square_120_from_64 = []
+    square_64_from_120 = [-1] * 120
+    for square in range(64):
+        square_120 = 21 + (square % 8) + 10 * (square // 8)
+        square_120_from_64.append(square_120)
+        square_64_from_120[square_120] = square
+    return tuple(square_120_from_64), tuple(square_64_from_120)
+
+
+SQUARE_120_FROM_64, SQUARE_64_FROM_120 = build_square_maps()
+BOARD_SQUARES_120 = SQUARE_120_FROM_64
+
+
 def build_merged_tables() -> tuple:
-    """Merge material and PST into tables by piece code and 0-63 square, Black negated."""
+    """Merge material and PST into tables by piece code and square, Black negated."""
     mg_64 = [0] * (PIECE_CODE_COUNT * 64)
     eg_64 = [0] * (PIECE_CODE_COUNT * 64)
+    mg_120 = [0] * (PIECE_CODE_COUNT * 120)
+    eg_120 = [0] * (PIECE_CODE_COUNT * 120)
     for piece_type in range(PAWN, KING + 1):
         mg_table = MG_TABLES[piece_type]
         eg_table = EG_TABLES[piece_type]
@@ -243,14 +309,19 @@ def build_merged_tables() -> tuple:
             white_eg = EG_VALUES[piece_type] + eg_table[square ^ 56]
             black_mg = -(MG_VALUES[piece_type] + mg_table[square])
             black_eg = -(EG_VALUES[piece_type] + eg_table[square])
+            square_120 = SQUARE_120_FROM_64[square]
             mg_64[piece_type * 64 + square] = white_mg
             eg_64[piece_type * 64 + square] = white_eg
             mg_64[black_code * 64 + square] = black_mg
             eg_64[black_code * 64 + square] = black_eg
-    return mg_64, eg_64
+            mg_120[piece_type * 120 + square_120] = white_mg
+            eg_120[piece_type * 120 + square_120] = white_eg
+            mg_120[black_code * 120 + square_120] = black_mg
+            eg_120[black_code * 120 + square_120] = black_eg
+    return mg_64, eg_64, mg_120, eg_120
 
 
-MG_64, EG_64 = build_merged_tables()
+MG_64, EG_64, MG_120, EG_120 = build_merged_tables()
 
 
 def build_phase_table() -> list:
@@ -263,6 +334,42 @@ def build_phase_table() -> list:
 
 
 PHASE_OF_CODE = build_phase_table()
+
+
+def build_castling_mask() -> list:
+    """Return the per-square mask that clears castling rights when touched."""
+    mask = [15] * 120
+    mask[21] = 13
+    mask[25] = 12
+    mask[28] = 14
+    mask[91] = 7
+    mask[95] = 3
+    mask[98] = 11
+    return mask
+
+
+CASTLING_MASK = build_castling_mask()
+
+
+def build_zobrist_keys() -> tuple:
+    """Create reproducible 64-bit Zobrist keys from a private generator."""
+    # A private generator keeps the keys identical whatever seed the judge sets.
+    generator = random.Random(ZOBRIST_SEED)
+    piece_keys = [0] * (PIECE_CODE_COUNT * 120)
+    for piece_code in range(PIECE_CODE_COUNT):
+        for square_120 in range(120):
+            piece_keys[piece_code * 120 + square_120] = generator.getrandbits(64)
+    castling_keys = []
+    for castling in range(16):
+        castling_keys.append(generator.getrandbits(64))
+    ep_keys = []
+    for file_index in range(8):
+        ep_keys.append(generator.getrandbits(64))
+    side_key = generator.getrandbits(64)
+    return piece_keys, castling_keys, ep_keys, side_key
+
+
+ZOBRIST_PIECES, ZOBRIST_CASTLING, ZOBRIST_EP_FILES, ZOBRIST_SIDE = build_zobrist_keys()
 
 
 BOOK_LINES = [
@@ -470,11 +577,636 @@ def halve_history(history: list) -> None:
         history[i] >>= 1
 
 
+def square_name_120(square_120: int) -> str:
+    """Return the algebraic name of a 120-board square."""
+    file_index = (square_120 % 10) - 1
+    rank_index = (square_120 // 10) - 2
+    return "abcdefgh"[file_index] + str(rank_index + 1)
+
+
+def move_to_uci(move: int) -> str:
+    """Convert a packed Core B move to UCI, including the promotion letter."""
+    from_square = move & SQUARE_MASK
+    to_square = (move >> TO_SHIFT) & SQUARE_MASK
+    flag = move >> FLAG_SHIFT
+    uci = square_name_120(from_square) + square_name_120(to_square)
+    if flag & FLAG_PROMOTION:
+        uci += PROMOTION_LETTERS[flag & 3]
+    return uci
+
+
 def piece_code_of(piece: chess.Piece) -> int:
     """Return the Core B piece code of a python-chess piece."""
     if piece.color == chess.WHITE:
         return piece.piece_type
     return piece.piece_type + BLACK_OFFSET
+
+
+def castling_bits_of(board: chess.Board) -> int:
+    """Return python-chess castling rights as the Core B bitmask."""
+    rights = board.clean_castling_rights()
+    bits = 0
+    if rights & chess.BB_H1:
+        bits |= CASTLE_WHITE_KING
+    if rights & chess.BB_A1:
+        bits |= CASTLE_WHITE_QUEEN
+    if rights & chess.BB_H8:
+        bits |= CASTLE_BLACK_KING
+    if rights & chess.BB_A8:
+        bits |= CASTLE_BLACK_QUEEN
+    return bits
+
+
+class MailboxBoard:
+    """Core B position: a 10x12 mailbox with in-place make and unmake."""
+
+    def __init__(self) -> None:
+        """Start from the standard initial position."""
+        self.squares = [OFF_BOARD] * 120
+        self.side = WHITE_SIDE
+        self.castling = 0
+        self.ep_square = 0
+        self.ep_hash_key = 0
+        self.halfmove = 0
+        self.king_squares = [0, 0]
+        self.piece_counts = [0] * PIECE_CODE_COUNT
+        self.mg_score = 0
+        self.eg_score = 0
+        self.phase = 0
+        self.hash_value = 0
+        self.hash_history = []
+        self.undo_stack = []
+        self.load_board(chess.Board())
+
+    def load_board(self, board: chess.Board) -> None:
+        """Copy a python-chess position, starting a fresh hash history."""
+        squares = [OFF_BOARD] * 120
+        for square_120 in BOARD_SQUARES_120:
+            squares[square_120] = EMPTY
+        for square, piece in board.piece_map().items():
+            squares[SQUARE_120_FROM_64[square]] = piece_code_of(piece)
+        self.squares = squares
+        self.side = WHITE_SIDE if board.turn == chess.WHITE else BLACK_SIDE
+        self.castling = castling_bits_of(board)
+        if board.ep_square is None:
+            self.ep_square = 0
+        else:
+            self.ep_square = SQUARE_120_FROM_64[board.ep_square]
+        self.halfmove = board.halfmove_clock
+        self.undo_stack = []
+        self.refresh_derived_state()
+        self.hash_history = [self.hash_value]
+
+    def refresh_derived_state(self) -> None:
+        """Recompute counts, kings, scores, phase and hash from the squares."""
+        counts, kings, mg_score, eg_score, phase = self.compute_material()
+        self.piece_counts = counts
+        self.king_squares = kings
+        self.mg_score = mg_score
+        self.eg_score = eg_score
+        self.phase = phase
+        self.ep_hash_key = self.compute_ep_hash_key()
+        self.hash_value = self.compute_hash()
+
+    def compute_material(self) -> tuple:
+        """Return piece counts, king squares and scores computed from scratch."""
+        counts = [0] * PIECE_CODE_COUNT
+        kings = [0, 0]
+        mg_score = 0
+        eg_score = 0
+        phase = 0
+        for square_120 in BOARD_SQUARES_120:
+            piece = self.squares[square_120]
+            if piece == EMPTY:
+                continue
+            counts[piece] += 1
+            mg_score += MG_120[piece * 120 + square_120]
+            eg_score += EG_120[piece * 120 + square_120]
+            phase += PHASE_OF_CODE[piece]
+            if piece == WHITE_KING:
+                kings[WHITE_SIDE] = square_120
+            elif piece == BLACK_KING:
+                kings[BLACK_SIDE] = square_120
+        return counts, kings, mg_score, eg_score, phase
+
+    def compute_ep_hash_key(self) -> int:
+        """Return the en-passant hash key, used only if a capture is possible."""
+        if self.ep_square == 0:
+            return 0
+        if self.side == WHITE_SIDE:
+            pushed_pawn = self.ep_square - 10
+            capturer = WHITE_PAWN
+        else:
+            pushed_pawn = self.ep_square + 10
+            capturer = BLACK_PAWN
+        if self.squares[pushed_pawn - 1] == capturer or self.squares[pushed_pawn + 1] == capturer:
+            return ZOBRIST_EP_FILES[(self.ep_square % 10) - 1]
+        return 0
+
+    def compute_hash(self) -> int:
+        """Return the Zobrist hash computed from scratch."""
+        hash_value = 0
+        for square_120 in BOARD_SQUARES_120:
+            piece = self.squares[square_120]
+            if piece != EMPTY:
+                hash_value ^= ZOBRIST_PIECES[piece * 120 + square_120]
+        hash_value ^= ZOBRIST_CASTLING[self.castling]
+        hash_value ^= self.compute_ep_hash_key()
+        if self.side == BLACK_SIDE:
+            hash_value ^= ZOBRIST_SIDE
+        return hash_value
+
+    def matches(self, board: chess.Board) -> bool:
+        """Return True when this position and its incremental state equal the board."""
+        for square in range(64):
+            piece = board.piece_at(square)
+            expected = EMPTY if piece is None else piece_code_of(piece)
+            if self.squares[SQUARE_120_FROM_64[square]] != expected:
+                return False
+        side = WHITE_SIDE if board.turn == chess.WHITE else BLACK_SIDE
+        if self.side != side or self.castling != castling_bits_of(board):
+            return False
+        expected_ep = 0 if board.ep_square is None else SQUARE_120_FROM_64[board.ep_square]
+        if self.ep_square != expected_ep or self.halfmove != board.halfmove_clock:
+            return False
+        counts, kings, mg_score, eg_score, phase = self.compute_material()
+        if counts != self.piece_counts or kings != self.king_squares:
+            return False
+        if mg_score != self.mg_score or eg_score != self.eg_score or phase != self.phase:
+            return False
+        if self.ep_hash_key != self.compute_ep_hash_key():
+            return False
+        return self.hash_value == self.compute_hash() and self.hash_history[-1] == self.hash_value
+
+    def make_move(self, move: int) -> None:
+        """Play a packed pseudo-legal move in place and push its undo record."""
+        squares = self.squares
+        side = self.side
+        counts = self.piece_counts
+        from_square = move & SQUARE_MASK
+        to_square = (move >> TO_SHIFT) & SQUARE_MASK
+        flag = move >> FLAG_SHIFT
+        piece = squares[from_square]
+        captured = squares[to_square]
+        self.undo_stack.append((move, captured, self.castling, self.ep_square, self.ep_hash_key,
+                                self.halfmove, self.hash_value, self.mg_score, self.eg_score,
+                                self.phase))
+        hash_value = self.hash_value ^ self.ep_hash_key ^ ZOBRIST_SIDE
+        mg_score = self.mg_score
+        eg_score = self.eg_score
+        phase = self.phase
+        index = piece * 120 + from_square
+        mg_score -= MG_120[index]
+        eg_score -= EG_120[index]
+        hash_value ^= ZOBRIST_PIECES[index]
+        halfmove = self.halfmove + 1
+        if captured != EMPTY:
+            index = captured * 120 + to_square
+            mg_score -= MG_120[index]
+            eg_score -= EG_120[index]
+            hash_value ^= ZOBRIST_PIECES[index]
+            phase -= PHASE_OF_CODE[captured]
+            counts[captured] -= 1
+            halfmove = 0
+        placed = piece
+        if flag & FLAG_PROMOTION:
+            placed = (flag & 3) + KNIGHT + (side << 3)
+            counts[piece] -= 1
+            counts[placed] += 1
+            phase += PHASE_OF_CODE[placed]
+        squares[from_square] = EMPTY
+        squares[to_square] = placed
+        index = placed * 120 + to_square
+        mg_score += MG_120[index]
+        eg_score += EG_120[index]
+        hash_value ^= ZOBRIST_PIECES[index]
+        if flag == FLAG_EN_PASSANT:
+            if side == WHITE_SIDE:
+                victim_square = to_square - 10
+            else:
+                victim_square = to_square + 10
+            victim = squares[victim_square]
+            squares[victim_square] = EMPTY
+            index = victim * 120 + victim_square
+            mg_score -= MG_120[index]
+            eg_score -= EG_120[index]
+            hash_value ^= ZOBRIST_PIECES[index]
+            counts[victim] -= 1
+        elif flag == FLAG_KING_CASTLE or flag == FLAG_QUEEN_CASTLE:
+            if flag == FLAG_KING_CASTLE:
+                rook_from = from_square + 3
+                rook_to = from_square + 1
+            else:
+                rook_from = from_square - 4
+                rook_to = from_square - 1
+            rook = squares[rook_from]
+            squares[rook_from] = EMPTY
+            squares[rook_to] = rook
+            index = rook * 120 + rook_from
+            mg_score -= MG_120[index]
+            eg_score -= EG_120[index]
+            hash_value ^= ZOBRIST_PIECES[index]
+            index = rook * 120 + rook_to
+            mg_score += MG_120[index]
+            eg_score += EG_120[index]
+            hash_value ^= ZOBRIST_PIECES[index]
+        piece_type = piece & 7
+        if piece_type == KING:
+            self.king_squares[side] = to_square
+        elif piece_type == PAWN:
+            halfmove = 0
+        castling = self.castling
+        new_castling = castling & CASTLING_MASK[from_square] & CASTLING_MASK[to_square]
+        if new_castling != castling:
+            hash_value ^= ZOBRIST_CASTLING[castling] ^ ZOBRIST_CASTLING[new_castling]
+            self.castling = new_castling
+        ep_hash_key = 0
+        if flag == FLAG_DOUBLE_PUSH:
+            self.ep_square = (from_square + to_square) >> 1
+            enemy_pawn = BLACK_PAWN if side == WHITE_SIDE else WHITE_PAWN
+            # Polyglot rule: the key counts only if an enemy pawn could capture.
+            if squares[to_square - 1] == enemy_pawn or squares[to_square + 1] == enemy_pawn:
+                ep_hash_key = ZOBRIST_EP_FILES[(to_square % 10) - 1]
+                hash_value ^= ep_hash_key
+        else:
+            self.ep_square = 0
+        self.ep_hash_key = ep_hash_key
+        self.halfmove = halfmove
+        self.side = side ^ 1
+        self.mg_score = mg_score
+        self.eg_score = eg_score
+        self.phase = phase
+        self.hash_value = hash_value
+        self.hash_history.append(hash_value)
+
+    def unmake_move(self) -> None:
+        """Take back the last move from its undo record without recomputing."""
+        record = self.undo_stack.pop()
+        self.hash_history.pop()
+        move = record[0]
+        side = self.side ^ 1
+        self.side = side
+        self.castling = record[2]
+        self.ep_square = record[3]
+        self.ep_hash_key = record[4]
+        self.halfmove = record[5]
+        self.hash_value = record[6]
+        self.mg_score = record[7]
+        self.eg_score = record[8]
+        self.phase = record[9]
+        if move == 0:
+            return
+        squares = self.squares
+        counts = self.piece_counts
+        captured = record[1]
+        from_square = move & SQUARE_MASK
+        to_square = (move >> TO_SHIFT) & SQUARE_MASK
+        flag = move >> FLAG_SHIFT
+        piece = squares[to_square]
+        if flag & FLAG_PROMOTION:
+            counts[piece] -= 1
+            piece = PAWN + (side << 3)
+            counts[piece] += 1
+        squares[from_square] = piece
+        squares[to_square] = captured
+        if captured != EMPTY:
+            counts[captured] += 1
+        if flag == FLAG_EN_PASSANT:
+            if side == WHITE_SIDE:
+                squares[to_square - 10] = BLACK_PAWN
+                counts[BLACK_PAWN] += 1
+            else:
+                squares[to_square + 10] = WHITE_PAWN
+                counts[WHITE_PAWN] += 1
+        elif flag == FLAG_KING_CASTLE:
+            squares[from_square + 3] = squares[from_square + 1]
+            squares[from_square + 1] = EMPTY
+        elif flag == FLAG_QUEEN_CASTLE:
+            squares[from_square - 4] = squares[from_square - 1]
+            squares[from_square - 1] = EMPTY
+        if (piece & 7) == KING:
+            self.king_squares[side] = from_square
+
+    def make_null_move(self) -> None:
+        """Pass the turn; the halfmove clock is zeroed so repetition scans stop here."""
+        self.undo_stack.append((0, EMPTY, self.castling, self.ep_square, self.ep_hash_key,
+                                self.halfmove, self.hash_value, self.mg_score, self.eg_score,
+                                self.phase))
+        hash_value = self.hash_value ^ self.ep_hash_key ^ ZOBRIST_SIDE
+        self.ep_square = 0
+        self.ep_hash_key = 0
+        self.halfmove = 0
+        self.side ^= 1
+        self.hash_value = hash_value
+        self.hash_history.append(hash_value)
+
+    def undo_to(self, stack_size: int) -> None:
+        """Unmake moves until the undo stack is back to the given size."""
+        while len(self.undo_stack) > stack_size:
+            self.unmake_move()
+
+    def is_attacked(self, square: int, by_side: int) -> bool:
+        """Return True if the given side attacks the square."""
+        squares = self.squares
+        if by_side == WHITE_SIDE:
+            if squares[square - 9] == WHITE_PAWN or squares[square - 11] == WHITE_PAWN:
+                return True
+            knight = WHITE_KNIGHT
+            bishop = WHITE_BISHOP
+            rook = WHITE_ROOK
+            queen = WHITE_QUEEN
+            king = WHITE_KING
+        else:
+            if squares[square + 9] == BLACK_PAWN or squares[square + 11] == BLACK_PAWN:
+                return True
+            knight = BLACK_KNIGHT
+            bishop = BLACK_BISHOP
+            rook = BLACK_ROOK
+            queen = BLACK_QUEEN
+            king = BLACK_KING
+        for offset in KNIGHT_OFFSETS:
+            if squares[square + offset] == knight:
+                return True
+        for direction in BISHOP_DIRECTIONS:
+            target_square = square + direction
+            target = squares[target_square]
+            if target == king:
+                return True
+            while target == EMPTY:
+                target_square += direction
+                target = squares[target_square]
+            if target == bishop or target == queen:
+                return True
+        for direction in ROOK_DIRECTIONS:
+            target_square = square + direction
+            target = squares[target_square]
+            if target == king:
+                return True
+            while target == EMPTY:
+                target_square += direction
+                target = squares[target_square]
+            if target == rook or target == queen:
+                return True
+        return False
+
+    def side_in_check(self) -> bool:
+        """Return True if the side to move is in check."""
+        return self.is_attacked(self.king_squares[self.side], self.side ^ 1)
+
+    def generate_moves(self, captures_only: bool) -> list:
+        """Return pseudo-legal packed moves; captures_only keeps captures and queen promotions."""
+        squares = self.squares
+        side = self.side
+        ep_square = self.ep_square
+        moves = []
+        # Local alias avoids an attribute lookup per generated move.
+        add_move = moves.append
+        if side == WHITE_SIDE:
+            enemy_low = BLACK_PAWN
+            enemy_high = BLACK_KING
+            forward = 10
+            capture_directions = (9, 11)
+            start_low = 31
+            start_high = 38
+            promotion_low = 91
+            promotion_high = 98
+        else:
+            enemy_low = WHITE_PAWN
+            enemy_high = WHITE_KING
+            forward = -10
+            capture_directions = (-9, -11)
+            start_low = 81
+            start_high = 88
+            promotion_low = 21
+            promotion_high = 28
+        for from_square in BOARD_SQUARES_120:
+            piece = squares[from_square]
+            if piece == EMPTY or (piece >> 3) != side:
+                continue
+            piece_type = piece & 7
+            if piece_type == PAWN:
+                to_square = from_square + forward
+                promotes = promotion_low <= to_square <= promotion_high
+                base = from_square | (to_square << TO_SHIFT)
+                if squares[to_square] == EMPTY:
+                    if promotes:
+                        add_move(base | (FLAG_QUEEN_PROMOTION << FLAG_SHIFT))
+                        if not captures_only:
+                            add_move(base | (FLAG_PROMOTION << FLAG_SHIFT))
+                            add_move(base | ((FLAG_PROMOTION + 1) << FLAG_SHIFT))
+                            add_move(base | ((FLAG_PROMOTION + 2) << FLAG_SHIFT))
+                    elif not captures_only:
+                        add_move(base)
+                        double_square = to_square + forward
+                        on_start_rank = start_low <= from_square <= start_high
+                        if on_start_rank and squares[double_square] == EMPTY:
+                            add_move(from_square | (double_square << TO_SHIFT)
+                                     | (FLAG_DOUBLE_PUSH << FLAG_SHIFT))
+                for direction in capture_directions:
+                    to_square = from_square + direction
+                    target = squares[to_square]
+                    base = from_square | (to_square << TO_SHIFT)
+                    if enemy_low <= target <= enemy_high:
+                        if promotes:
+                            add_move(base | (FLAG_QUEEN_CAPTURE_PROMOTION << FLAG_SHIFT))
+                            if not captures_only:
+                                add_move(base | (FLAG_CAPTURE_PROMOTION << FLAG_SHIFT))
+                                add_move(base | ((FLAG_CAPTURE_PROMOTION + 1) << FLAG_SHIFT))
+                                add_move(base | ((FLAG_CAPTURE_PROMOTION + 2) << FLAG_SHIFT))
+                        else:
+                            add_move(base | (FLAG_CAPTURE << FLAG_SHIFT))
+                    elif to_square == ep_square:
+                        add_move(base | (FLAG_EN_PASSANT << FLAG_SHIFT))
+            elif piece_type == KNIGHT or piece_type == KING:
+                offsets = KNIGHT_OFFSETS if piece_type == KNIGHT else KING_OFFSETS
+                for offset in offsets:
+                    to_square = from_square + offset
+                    target = squares[to_square]
+                    if target == EMPTY:
+                        if not captures_only:
+                            add_move(from_square | (to_square << TO_SHIFT))
+                    elif enemy_low <= target <= enemy_high:
+                        add_move(from_square | (to_square << TO_SHIFT)
+                                 | (FLAG_CAPTURE << FLAG_SHIFT))
+            else:
+                for direction in SLIDER_DIRECTIONS[piece_type]:
+                    to_square = from_square + direction
+                    target = squares[to_square]
+                    while target == EMPTY:
+                        if not captures_only:
+                            add_move(from_square | (to_square << TO_SHIFT))
+                        to_square += direction
+                        target = squares[to_square]
+                    if enemy_low <= target <= enemy_high:
+                        add_move(from_square | (to_square << TO_SHIFT)
+                                 | (FLAG_CAPTURE << FLAG_SHIFT))
+        if not captures_only and self.castling:
+            self.add_castling_moves(moves)
+        return moves
+
+    def add_castling_moves(self, moves: list) -> None:
+        """Append castling moves whose path is empty and not attacked."""
+        squares = self.squares
+        castling = self.castling
+        if self.side == WHITE_SIDE:
+            king_square = 25
+            king_right = CASTLE_WHITE_KING
+            queen_right = CASTLE_WHITE_QUEEN
+            king = WHITE_KING
+            rook = WHITE_ROOK
+            enemy = BLACK_SIDE
+        else:
+            king_square = 95
+            king_right = CASTLE_BLACK_KING
+            queen_right = CASTLE_BLACK_QUEEN
+            king = BLACK_KING
+            rook = BLACK_ROOK
+            enemy = WHITE_SIDE
+        if squares[king_square] != king or self.is_attacked(king_square, enemy):
+            return
+        if (castling & king_right and squares[king_square + 1] == EMPTY
+                and squares[king_square + 2] == EMPTY and squares[king_square + 3] == rook
+                and not self.is_attacked(king_square + 1, enemy)
+                and not self.is_attacked(king_square + 2, enemy)):
+            moves.append(king_square | ((king_square + 2) << TO_SHIFT)
+                         | (FLAG_KING_CASTLE << FLAG_SHIFT))
+        if (castling & queen_right and squares[king_square - 1] == EMPTY
+                and squares[king_square - 2] == EMPTY and squares[king_square - 3] == EMPTY
+                and squares[king_square - 4] == rook
+                and not self.is_attacked(king_square - 1, enemy)
+                and not self.is_attacked(king_square - 2, enemy)):
+            moves.append(king_square | ((king_square - 2) << TO_SHIFT)
+                         | (FLAG_QUEEN_CASTLE << FLAG_SHIFT))
+
+    def legal_moves(self) -> list:
+        """Return the legal packed moves by filtering pseudo-legal ones."""
+        side = self.side
+        enemy = side ^ 1
+        legal = []
+        for move in self.generate_moves(False):
+            self.make_move(move)
+            if not self.is_attacked(self.king_squares[side], enemy):
+                legal.append(move)
+            self.unmake_move()
+        return legal
+
+    def parse_uci(self, uci: str) -> int:
+        """Return the packed move for a UCI string, inferring flags from the board."""
+        from_square = SQUARE_120_FROM_64[chess.parse_square(uci[0:2])]
+        to_square = SQUARE_120_FROM_64[chess.parse_square(uci[2:4])]
+        piece = self.squares[from_square]
+        target = self.squares[to_square]
+        piece_type = piece & 7
+        flag = FLAG_QUIET
+        if len(uci) > 4:
+            flag = FLAG_PROMOTION + PROMOTION_LETTERS.index(uci[4].lower())
+            if target != EMPTY:
+                flag += FLAG_CAPTURE
+        elif target != EMPTY:
+            flag = FLAG_CAPTURE
+        elif (piece_type == PAWN and to_square == self.ep_square
+              and (to_square - from_square) % 10 != 0):
+            flag = FLAG_EN_PASSANT
+        elif piece_type == KING and to_square - from_square == 2:
+            flag = FLAG_KING_CASTLE
+        elif piece_type == KING and from_square - to_square == 2:
+            flag = FLAG_QUEEN_CASTLE
+        elif piece_type == PAWN and abs(to_square - from_square) == 20:
+            flag = FLAG_DOUBLE_PUSH
+        return from_square | (to_square << TO_SHIFT) | (flag << FLAG_SHIFT)
+
+    def make_uci_move(self, uci: str) -> None:
+        """Play a UCI move given by the judge."""
+        self.make_move(self.parse_uci(uci))
+
+    def is_repetition(self) -> bool:
+        """Return True if this position already occurred since the last irreversible move."""
+        history = self.hash_history
+        current = history[-1]
+        index = len(history) - 5
+        stop = len(history) - 1 - self.halfmove
+        if stop < 0:
+            stop = 0
+        while index >= stop:
+            if history[index] == current:
+                return True
+            index -= 2
+        return False
+
+    def is_insufficient_material(self) -> bool:
+        """Return True when neither side has mating material."""
+        counts = self.piece_counts
+        if counts[WHITE_PAWN] or counts[BLACK_PAWN] or counts[WHITE_ROOK] or counts[BLACK_ROOK]:
+            return False
+        if counts[WHITE_QUEEN] or counts[BLACK_QUEEN]:
+            return False
+        white_minors = counts[WHITE_KNIGHT] + counts[WHITE_BISHOP]
+        black_minors = counts[BLACK_KNIGHT] + counts[BLACK_BISHOP]
+        return white_minors <= 1 and black_minors <= 1
+
+    def has_non_pawn_material(self) -> bool:
+        """Return True if the side to move has a piece other than pawns and king."""
+        counts = self.piece_counts
+        offset = self.side << 3
+        return (counts[KNIGHT + offset] + counts[BISHOP + offset] + counts[ROOK + offset]
+                + counts[QUEEN + offset]) > 0
+
+    def find_piece(self, piece_code: int) -> int:
+        """Return the 0-63 square of the first piece with this code, or -1."""
+        for square_120 in BOARD_SQUARES_120:
+            if self.squares[square_120] == piece_code:
+                return SQUARE_64_FROM_120[square_120]
+        return -1
+
+    def mop_up(self) -> int:
+        """Return the mop-up bonus from White's view in pawnless endings."""
+        counts = self.piece_counts
+        white_pieces = (counts[WHITE_KNIGHT] + counts[WHITE_BISHOP] + counts[WHITE_ROOK]
+                        + counts[WHITE_QUEEN])
+        black_pieces = (counts[BLACK_KNIGHT] + counts[BLACK_BISHOP] + counts[BLACK_ROOK]
+                        + counts[BLACK_QUEEN])
+        white_king = SQUARE_64_FROM_120[self.king_squares[WHITE_SIDE]]
+        black_king = SQUARE_64_FROM_120[self.king_squares[BLACK_SIDE]]
+        if black_pieces == 0 and white_pieces > 0:
+            bishop_square = -1
+            if counts[WHITE_BISHOP] == 1:
+                bishop_square = self.find_piece(WHITE_BISHOP)
+            return mop_up_bonus(black_king, white_king, counts[WHITE_KNIGHT], counts[WHITE_BISHOP],
+                                counts[WHITE_ROOK], counts[WHITE_QUEEN], bishop_square)
+        if white_pieces == 0 and black_pieces > 0:
+            bishop_square = -1
+            if counts[BLACK_BISHOP] == 1:
+                bishop_square = self.find_piece(BLACK_BISHOP)
+            return -mop_up_bonus(white_king, black_king, counts[BLACK_KNIGHT],
+                                 counts[BLACK_BISHOP], counts[BLACK_ROOK], counts[BLACK_QUEEN],
+                                 bishop_square)
+        return 0
+
+    def white_score(self) -> int:
+        """Return the tapered evaluation from White's view, without tempo."""
+        counts = self.piece_counts
+        mg_score = self.mg_score
+        eg_score = self.eg_score
+        if counts[WHITE_BISHOP] >= 2:
+            mg_score += BISHOP_PAIR_MG
+            eg_score += BISHOP_PAIR_EG
+        if counts[BLACK_BISHOP] >= 2:
+            mg_score -= BISHOP_PAIR_MG
+            eg_score -= BISHOP_PAIR_EG
+        phase = self.phase
+        if phase > FULL_PHASE:
+            phase = FULL_PHASE
+        score = (mg_score * phase + eg_score * (FULL_PHASE - phase)) // FULL_PHASE
+        if counts[WHITE_PAWN] == 0 and counts[BLACK_PAWN] == 0:
+            score += self.mop_up()
+        return score
+
+    def evaluate(self) -> int:
+        """Return the static evaluation for the side to move, with tempo."""
+        score = self.white_score()
+        if self.side == WHITE_SIDE:
+            return score + TEMPO_BONUS
+        return TEMPO_BONUS - score
 
 
 def score_python_chess_board(board: chess.Board) -> tuple:
