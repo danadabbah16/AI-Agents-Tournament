@@ -63,11 +63,11 @@ def best_city(actions, board):
     return max(options, key=lambda a: pips.get(a["node"], 0))
 
 
-def best_robber(actions):
-    steal = [a for a in actions if a.get("steal_from") == "opponent"]
-    if steal:
-        return steal[0]
-    return actions[0]
+def best_robber(actions, observation=None):
+    if observation is None:
+        steal = [a for a in actions if a.get("steal_from") == "opponent"]
+        return steal[0] if steal else actions[0]
+    return robber_choice(observation, board_info(observation["board"]), actions)
 
 
 def afford(resources, cost):
@@ -96,6 +96,7 @@ def useful_trade(actions, resources):
 
 
 def act(observation):
+    """Play with the improved goal-directed policy. Fall back to the simple baseline."""
     try:
         return {"action": smart_policy(observation)}
     except Exception:
@@ -106,18 +107,18 @@ def act(observation):
 
 
 def learned_policy(observation):
-    """v2: choose the action TYPE with the highest learned Q, then the best action of that type.
-
-    Falls back to the baseline when there is nothing to choose between, or when
-    the table does not know every option in this state.
-    """
+    """Q-table over action types. Never overrides an available city/settlement build."""
     kinds = sorted({a["type"] for a in observation["actions"]})
+    if "BUILD_CITY" in kinds or "BUILD_SETTLEMENT" in kinds:
+        return smart_policy(observation)
     if len(kinds) < 2 or observation.get("phase") == "initial_placement":
-        return heuristic_policy(observation)
-    if any(q_key(observation, kind) not in Q for kind in kinds):
-        return heuristic_policy(observation)
-    best = max(kinds, key=lambda kind: Q[q_key(observation, kind)])
-    return pick_of_type(observation, best)["id"]
+        return smart_policy(observation)
+    known = [k for k in kinds if q_key(observation, k) in Q]
+    if len(known) < 2:
+        return smart_policy(observation)
+    best = max(known, key=lambda kind: Q[q_key(observation, kind)])
+    picked = pick_of_type(observation, best)
+    return picked["id"] if picked is not None else smart_policy(observation)
 
 
 def heuristic_policy(observation):
@@ -166,14 +167,13 @@ def heuristic_policy(observation):
 
 
 def state_features(observation):
-    """Small abstraction of the state, so a table can cover it. Must be deterministic."""
+    """Small abstraction for the Q-table. Must be deterministic."""
     me = observation["me"]
     opp = observation["opponent"]
     my_vp = me.get("victory_points", me.get("visible_victory_points", 0))
-    lead = my_vp - opp.get("visible_victory_points", 0)
-    lead = max(-2, min(2, lead))
+    lead = max(-2, min(2, my_vp - opp.get("visible_victory_points", 0)))
     cards = me.get("resource_cards", 0)
-    hand = 0 if cards <= 3 else (1 if cards <= 7 else 2)  # 8+ risks the discard on a 7
+    hand = 0 if cards <= 3 else (1 if cards <= 7 else 2)
     return [observation.get("phase"), my_vp, lead, hand]
 
 
@@ -197,15 +197,24 @@ def q_key(observation, kind):
 
 
 def pick_of_type(observation, kind):
-    """The concrete action of this type that the baseline's helpers prefer."""
+    """Concrete action of this type, using the improved helpers when possible."""
     actions = observation["actions"]
     board = observation["board"]
+    info = board_info(board)
     if kind == "BUILD_SETTLEMENT":
-        return best_settlement(actions, board)
+        opts = [a for a in actions if a["type"] == kind]
+        if not opts:
+            return None
+        have = my_resources_produced(observation["me"], info)
+        return max(opts, key=lambda a: node_value(a["node"], info, have))
     if kind == "BUILD_CITY":
         return best_city(actions, board)
+    if kind == "BUILD_ROAD":
+        roads = [a for a in actions if a["type"] == kind]
+        return best_road(observation, info, roads) if roads else None
     if kind == "MOVE_ROBBER":
-        return best_robber([a for a in actions if a["type"] == kind])
+        robbers = [a for a in actions if a["type"] == kind]
+        return robber_choice(observation, info, robbers) if robbers else None
     if kind == "MARITIME_TRADE":
         trade = useful_trade(actions, observation["me"].get("resources", {}))
         if trade is not None:
@@ -428,16 +437,32 @@ def smart_policy(obs):
         return actions[0]["id"]
 
     have = my_resources_produced(me, info)
+    my_vp = me.get("victory_points", me.get("visible_victory_points", 0))
+    opp_vp = opp.get("visible_victory_points", 0)
+
+    # Always take free VP when offered.
     if "BUILD_CITY" in by:
         return max(by["BUILD_CITY"], key=lambda a: sum(p for _, p, _ in info["prod"].get(a["node"], [])))["id"]
     if "BUILD_SETTLEMENT" in by:
         return max(by["BUILD_SETTLEMENT"], key=lambda a: node_value(a["node"], info, have))["id"]
-    if "PLAY_KNIGHT_CARD" in by:
-        return by["PLAY_KNIGHT_CARD"][0]["id"]
     if "ROLL" in by:
         return by["ROLL"][0]["id"]
 
+    # Knight only when it helps (army race, behind, or steal opportunity).
+    if "PLAY_KNIGHT_CARD" in by:
+        my_k = me.get("played_development_cards", {}).get("KNIGHT", 0)
+        opp_k = opp.get("played_development_cards", {}).get("KNIGHT", 0)
+        want_army = my_k + 1 >= 3 and my_k + 1 > opp_k
+        behind = my_vp < opp_vp
+        if want_army or behind or opp.get("resource_cards", 0) >= 4 or my_vp >= 5:
+            return by["PLAY_KNIGHT_CARD"][0]["id"]
+
     goal, plan = choose_goal(obs, info)
+    # Near the win: force city/settlement goals.
+    if my_vp >= 5 and len(me.get("settlements", [])) > 0:
+        goal = "CITY"
+    elif my_vp >= 5 and plan is not None and plan[2] == 0:
+        goal = "SETTLEMENT"
     cost = GOAL_COST[goal]
 
     if "PLAY_YEAR_OF_PLENTY" in by:
