@@ -545,8 +545,8 @@ def pack_tt_entry(move: int, flag: int, depth: int, age: int, score: int) -> int
             | ((score + TT_SCORE_OFFSET) << TT_SCORE_SHIFT))
 
 
-def store_tt_entry(table: dict, key, move: int, flag: int, depth: int, age: int,
-                   score: int, ply: int) -> None:
+def store_tt_entry(table: dict, key: int | tuple | str, move: int, flag: int, depth: int,
+                   age: int, score: int, ply: int) -> None:
     """Store a search result, replacing only shallower, older or non-exact entries."""
     if score > MATE_BOUND:
         score += ply
@@ -561,7 +561,7 @@ def store_tt_entry(table: dict, key, move: int, flag: int, depth: int, age: int,
     table[key] = pack_tt_entry(move, flag, depth, age, score)
 
 
-def probe_tt_score(entry: int, depth: int, alpha: int, beta: int, ply: int):
+def probe_tt_score(entry: int, depth: int, alpha: int, beta: int, ply: int) -> int | None:
     """Return the stored score if it settles this node, otherwise None."""
     if ((entry >> TT_DEPTH_SHIFT) & TT_DEPTH_MASK) < depth:
         return None
@@ -1287,7 +1287,7 @@ def finish_python_chess_score(board: chess.Board, mg_score: int, eg_score: int,
     return score
 
 
-def terminal_score(board: chess.Board):
+def terminal_score(board: chess.Board) -> int | None:
     """Return the finished-game score from White's view, or None if play goes on."""
     has_move = False
     for move in board.generate_legal_moves():
@@ -1376,11 +1376,6 @@ def python_chess_move_delta(board: chess.Board, move: chess.Move) -> tuple:
     return mg_delta, eg_delta, phase_delta
 
 
-def fen_position_key(board: chess.Board):
-    """Return the first four FEN fields as a position key."""
-    return book_key(board)
-
-
 def detect_transposition_key() -> bool:
     """Return True if python-chess offers its private transposition key."""
     try:
@@ -1399,11 +1394,12 @@ def detect_transposition_key() -> bool:
 USE_TRANSPOSITION_KEY = detect_transposition_key()
 
 
-def position_key(board: chess.Board):
+def position_key(board: chess.Board) -> tuple | str:
     """Return a hashable key identifying the position for Core A."""
     if USE_TRANSPOSITION_KEY:
         return board._transposition_key()
-    return fen_position_key(board)
+    # The first four FEN fields identify a position when the private key is unavailable.
+    return book_key(board)
 
 
 def encode_chess_move(move: chess.Move) -> int:
@@ -2321,7 +2317,7 @@ class GameState:
         self.core_b_enabled = False
         return False
 
-    def book_move(self, ply: int, legal_moves: list):
+    def book_move(self, ply: int, legal_moves: list) -> str | None:
         """Return a weighted-random book move, or None once the game leaves the book."""
         if not self.book_active or ply >= BOOK_MAX_PLY:
             return None

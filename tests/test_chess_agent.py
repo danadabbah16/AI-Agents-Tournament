@@ -2,6 +2,7 @@
 import random
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import chess
@@ -77,14 +78,14 @@ def make_observation(board: chess.Board, time_remaining: float = 5.0) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def fresh_state():
+def fresh_state() -> Iterator[None]:
     """Give every test a new game so module state never leaks between tests."""
     chess_agent.STATE.reset()
     yield
     chess_agent.STATE.reset()
 
 
-def test_evaluate_ranks_material():
+def test_evaluate_ranks_material() -> None:
     balanced = chess_agent.evaluate(chess.STARTING_FEN)
     white_up = chess_agent.evaluate(WHITE_UP_FEN)
     black_up = chess_agent.evaluate(BLACK_UP_FEN)
@@ -93,21 +94,21 @@ def test_evaluate_ranks_material():
     assert isinstance(white_up, int) and 800 < white_up < 1200
 
 
-def test_evaluate_scores_finished_games():
+def test_evaluate_scores_finished_games() -> None:
     assert chess_agent.evaluate("7k/6Q1/6K1/8/8/8/8/8 b - - 0 1") == 100000
     assert chess_agent.evaluate("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1") == 0
     assert chess_agent.evaluate("8/8/8/4k3/8/8/8/4K3 w - - 0 1") == 0
 
 
 @pytest.mark.parametrize("fen", CHECK_POSITIONS)
-def test_alphabeta_matches_minimax(fen):
+def test_alphabeta_matches_minimax(fen: str) -> None:
     plain = chess_agent.minimax(fen, 2)
     pruned = chess_agent.alphabeta(fen, 2)
     assert plain["value"] == pruned["value"]
     assert pruned["nodes"] <= plain["nodes"]
 
 
-def test_alphabeta_prunes_and_deepens():
+def test_alphabeta_prunes_and_deepens() -> None:
     fewer = False
     for fen in CHECK_POSITIONS:
         pruned_nodes = chess_agent.alphabeta(fen, 2)["nodes"]
@@ -118,7 +119,7 @@ def test_alphabeta_prunes_and_deepens():
     assert deep > shallow
 
 
-def test_book_lines_are_legal():
+def test_book_lines_are_legal() -> None:
     for line, weight in chess_agent.BOOK_LINES:
         board = chess.Board()
         for uci in line.split():
@@ -128,7 +129,7 @@ def test_book_lines_are_legal():
         assert weight > 0
 
 
-def test_book_covers_main_replies():
+def test_book_covers_main_replies() -> None:
     start = chess_agent.OPENING_BOOK[chess_agent.book_key(chess.Board())]
     assert sorted(start) == [["d2d4", 45], ["e2e4", 55]]
     for first_move in ("e2e4", "d2d4", "c2c4", "g1f3"):
@@ -138,14 +139,14 @@ def test_book_covers_main_replies():
 
 
 @pytest.mark.parametrize("fen, expected", PERFT_CASES)
-def test_perft(fen, expected):
+def test_perft(fen: str, expected: list) -> None:
     mailbox = mailbox_from_fen(fen)
     for depth, count in enumerate(expected, 1):
         assert perft(mailbox, depth) == count
     assert mailbox.matches(chess.Board(fen))
 
 
-def test_random_games_match_python_chess():
+def test_random_games_match_python_chess() -> None:
     generator = random.Random(2026)
     for game in range(30):
         board = chess.Board()
@@ -171,14 +172,14 @@ def test_random_games_match_python_chess():
             board.push(move)
 
 
-def test_uci_round_trip():
+def test_uci_round_trip() -> None:
     for fen, counts in PERFT_CASES:
         mailbox = mailbox_from_fen(fen)
         for move in mailbox.legal_moves():
             assert mailbox.parse_uci(chess_agent.move_to_uci(move)) == move
 
 
-def test_promotion_uci_names_the_piece():
+def test_promotion_uci_names_the_piece() -> None:
     mailbox = mailbox_from_fen("8/P6k/8/8/8/8/8/K7 w - - 0 1")
     names = set()
     for move in mailbox.legal_moves():
@@ -186,7 +187,7 @@ def test_promotion_uci_names_the_piece():
     assert {"a7a8q", "a7a8r", "a7a8b", "a7a8n"} <= names
 
 
-def test_castling_mask_clears_rights():
+def test_castling_mask_clears_rights() -> None:
     mailbox = mailbox_from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1")
     mailbox.make_uci_move("h1h8")
     assert mailbox.castling == chess_agent.CASTLE_WHITE_QUEEN | chess_agent.CASTLE_BLACK_QUEEN
@@ -197,7 +198,7 @@ def test_castling_mask_clears_rights():
     assert mailbox.castling == 15
 
 
-def test_castling_through_check_is_not_generated():
+def test_castling_through_check_is_not_generated() -> None:
     mailbox = mailbox_from_fen("4k3/8/8/8/8/8/5r2/R3K2R w KQ - 0 1")
     names = set()
     for move in mailbox.legal_moves():
@@ -206,7 +207,7 @@ def test_castling_through_check_is_not_generated():
     assert "e1c1" in names
 
 
-def test_en_passant_rank_pin():
+def test_en_passant_rank_pin() -> None:
     board = chess.Board(EN_PASSANT_PIN_FEN)
     mailbox = mailbox_from_fen(EN_PASSANT_PIN_FEN)
     names = set()
@@ -219,7 +220,7 @@ def test_en_passant_rank_pin():
     assert names == expected
 
 
-def test_repetition_is_detected():
+def test_repetition_is_detected() -> None:
     mailbox = chess_agent.MailboxBoard()
     for uci in ("g1f3", "g8f6", "f3g1", "f6g8"):
         assert not mailbox.is_repetition()
@@ -227,7 +228,7 @@ def test_repetition_is_detected():
     assert mailbox.is_repetition()
 
 
-def test_zobrist_keys_ignore_global_seed():
+def test_zobrist_keys_ignore_global_seed() -> None:
     random.seed(1)
     first = chess_agent.build_zobrist_keys()
     random.seed(2)
@@ -236,7 +237,7 @@ def test_zobrist_keys_ignore_global_seed():
     assert first[3] == chess_agent.ZOBRIST_SIDE
 
 
-def test_mop_up_prefers_cornered_king():
+def test_mop_up_prefers_cornered_king() -> None:
     centred = chess_agent.evaluate("8/8/8/3k4/8/8/8/4K2Q w - - 0 1")
     cornered = chess_agent.evaluate("k7/8/8/8/8/8/8/4K2Q w - - 0 1")
     assert cornered > centred
@@ -244,12 +245,12 @@ def test_mop_up_prefers_cornered_king():
     assert mailbox.white_score() == cornered
 
 
-def test_core_b_static_score_matches_evaluate():
+def test_core_b_static_score_matches_evaluate() -> None:
     for fen in CHECK_POSITIONS + [PERFT_CASES[1][0], PERFT_CASES[4][0]]:
         assert mailbox_from_fen(fen).white_score() == chess_agent.evaluate(fen)
 
 
-def test_time_budget_never_exceeds_hard_fraction():
+def test_time_budget_never_exceeds_hard_fraction() -> None:
     for remaining in (0.6, 0.8, 1.0, 2.0, 5.0, 10.0):
         for ply in range(0, 400, 7):
             for in_check in (False, True):
@@ -259,14 +260,14 @@ def test_time_budget_never_exceeds_hard_fraction():
                 assert soft <= hard <= usable * chess_agent.HARD_FRACTION + 1e-12
 
 
-def test_panic_budget_is_tiny():
+def test_panic_budget_is_tiny() -> None:
     soft, hard, depth_cap = chess_agent.compute_time_budget(0.5, 100, False)
     assert hard <= chess_agent.PANIC_LIMIT_S
     assert depth_cap == chess_agent.PANIC_DEPTH_CAP
 
 
 @pytest.mark.parametrize("core", ["A", "B"])
-def test_mate_in_two_is_found(core):
+def test_mate_in_two_is_found(core: str) -> None:
     board = chess.Board(MATE_IN_TWO_FEN)
     start = time.perf_counter()
     if core == "B":
@@ -292,7 +293,7 @@ def test_mate_in_two_is_found(core):
 
 
 @pytest.mark.parametrize("core", ["A", "B"])
-def test_wins_hanging_queen(core):
+def test_wins_hanging_queen(core: str) -> None:
     board = chess.Board(HANGING_QUEEN_FEN)
     start = time.perf_counter()
     if core == "B":
@@ -307,8 +308,9 @@ def test_wins_hanging_queen(core):
     assert uci == "c3d5"
 
 
-def test_act_returns_legal_move_when_search_raises(monkeypatch):
-    def broken_search(observation, start_time, remaining):
+def test_act_returns_legal_move_when_search_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_search(observation: dict, start_time: float, remaining: float) -> str:
+        """Stand in for the search and always fail."""
         raise RuntimeError("forced failure")
 
     monkeypatch.setattr(chess_agent.STATE, "search_move", broken_search)
@@ -319,24 +321,24 @@ def test_act_returns_legal_move_when_search_raises(monkeypatch):
     assert result["move"] in observation["legal_moves"]
 
 
-def test_act_survives_garbage_observation():
+def test_act_survives_garbage_observation() -> None:
     result = chess_agent.act({"legal_moves": ["e2e4", "d2d4"], "fen": "not a fen"})
     assert result["move"] in ("e2e4", "d2d4")
 
 
-def test_act_plays_only_move_instantly():
+def test_act_plays_only_move_instantly() -> None:
     board = chess.Board("7k/8/8/8/8/8/6q1/7K w - - 0 1")
     observation = make_observation(board)
     assert observation["legal_moves"] == ["h1g2"]
     assert chess_agent.act(observation) == {"move": "h1g2"}
 
 
-def test_act_uses_book_at_start():
+def test_act_uses_book_at_start() -> None:
     observation = make_observation(chess.Board())
     assert chess_agent.act(observation)["move"] in ("e2e4", "d2d4")
 
 
-def test_act_low_clock_is_fast_and_legal():
+def test_act_low_clock_is_fast_and_legal() -> None:
     board = chess.Board(CHECK_POSITIONS[2])
     observation = make_observation(board, time_remaining=0.2)
     start = time.perf_counter()
@@ -345,7 +347,7 @@ def test_act_low_clock_is_fast_and_legal():
     assert result["move"] in observation["legal_moves"]
 
 
-def test_act_plays_a_full_game_against_itself():
+def test_act_plays_a_full_game_against_itself() -> None:
     board = chess.Board()
     clocks = {chess.WHITE: 5.0, chess.BLACK: 5.0}
     while not board.is_game_over(claim_draw=True) and board.ply() < 120:
@@ -358,7 +360,7 @@ def test_act_plays_a_full_game_against_itself():
         board.push_uci(move)
 
 
-def test_sync_resets_for_a_new_game():
+def test_sync_resets_for_a_new_game() -> None:
     board = chess.Board()
     for uci in ("e2e4", "e7e5", "g1f3"):
         board.push_uci(uci)
@@ -371,7 +373,7 @@ def test_sync_resets_for_a_new_game():
     assert chess_agent.STATE.mailbox.matches(chess_agent.STATE.board)
 
 
-def test_sync_falls_back_to_fen_without_history():
+def test_sync_falls_back_to_fen_without_history() -> None:
     board = chess.Board(CHECK_POSITIONS[3])
     observation = make_observation(board)
     observation["history"] = ["e2e4"]
@@ -381,7 +383,7 @@ def test_sync_falls_back_to_fen_without_history():
     assert chess_agent.STATE.mailbox.matches(chess_agent.STATE.board)
 
 
-def test_core_b_is_disabled_on_root_mismatch():
+def test_core_b_is_disabled_on_root_mismatch() -> None:
     board = chess.Board()
     board.push_uci("e2e4")
     observation = make_observation(board)
