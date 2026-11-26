@@ -115,7 +115,8 @@ The border weight hedges against hunters that deliberately search the edges. It 
 | `predict_ship_belief(belief, length, orientation, move_probability)` | **Required function, the transition model.** One step: stay with `1 - move_probability`, otherwise move to a uniformly chosen legal neighbour. A ship with no legal move stays. |
 | `_depth(n)` | Distance of each cell from the nearest border. |
 | `_sonar_region(center, n)` | 0/1 mask of the 3x3 area around a sonar center. |
-| `act(observation)` | Entry point. Creates the `Agent` in the placement phase, then delegates. |
+| `act(observation)` | Entry point. Creates the `Agent` in the placement phase, then delegates. Any exception is logged to stderr and answered with a fallback (random placement or `_fallback_shot`), because an exception would otherwise lose the game. |
+| `_fallback_shot(observation)` | Random cell not shot yet. Used only after an internal error. |
 
 ### `class Belief(n, lengths, move_rate, bias=0.0, touch=1.0)`
 
