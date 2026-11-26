@@ -6,8 +6,8 @@ The opponent is the frozen v1 baseline. The result is written to q_table_line.py
 """
 import importlib.util
 import random
+import sys
 import time
-
 from games.catan.engine import SIDE_OF, adjudicate, legal_actions, new_game, observation_for, victory_points
 
 
@@ -119,5 +119,27 @@ def train():
     print(f"wrote q_table_line.py: kept {len(table)} of {len(Q)} keys (>= {MIN_VISITS} visits)")
 
 
+EVAL_SEEDS = range(100001, 100501)   # 500 seeds never used in training
+
+
+def evaluate():
+    """v2 (act, no exploration) against v1, each seed twice with sides swapped."""
+    v2 = lambda obs: agent.act(obs)["action"]
+    result = {"v2": 0, "v1": 0, "draw": 0}
+    for seed in EVAL_SEEDS:
+        for v2_side in ("A", "B"):
+            if v2_side == "A":
+                winner, _ = play_one_game(v2, v1.heuristic_policy, seed)
+            else:
+                winner, _ = play_one_game(v1.heuristic_policy, v2, seed)
+            result["draw" if winner is None else ("v2" if winner == v2_side else "v1")] += 1
+    games = sum(result.values())
+    print(f"{games} games on unseen seeds: {result}")
+    print(f"v2 win rate: {100 * result['v2'] / games:.1f}%")
+
+
 if __name__ == "__main__":
-    train()
+    if "--eval" in sys.argv:
+        evaluate()
+    else:
+        train()
