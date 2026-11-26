@@ -545,8 +545,8 @@ def pack_tt_entry(move: int, flag: int, depth: int, age: int, score: int) -> int
             | ((score + TT_SCORE_OFFSET) << TT_SCORE_SHIFT))
 
 
-def store_tt_entry(table: dict, key, move: int, flag: int, depth: int, age: int,
-                   score: int, ply: int) -> None:
+def store_tt_entry(table: dict, key: int | tuple | str, move: int, flag: int, depth: int,
+                   age: int, score: int, ply: int) -> None:
     """Store a search result, replacing only shallower, older or non-exact entries."""
     if score > MATE_BOUND:
         score += ply
@@ -561,7 +561,7 @@ def store_tt_entry(table: dict, key, move: int, flag: int, depth: int, age: int,
     table[key] = pack_tt_entry(move, flag, depth, age, score)
 
 
-def probe_tt_score(entry: int, depth: int, alpha: int, beta: int, ply: int):
+def probe_tt_score(entry: int, depth: int, alpha: int, beta: int, ply: int) -> int | None:
     """Return the stored score if it settles this node, otherwise None."""
     if ((entry >> TT_DEPTH_SHIFT) & TT_DEPTH_MASK) < depth:
         return None
@@ -1114,6 +1114,18 @@ class MailboxBoard:
             self.unmake_move()
         return legal
 
+    def has_legal_move(self) -> bool:
+        """Return True as soon as one legal move is found."""
+        side = self.side
+        enemy = side ^ 1
+        for move in self.generate_moves(False):
+            self.make_move(move)
+            legal = not self.is_attacked(self.king_squares[side], enemy)
+            self.unmake_move()
+            if legal:
+                return True
+        return False
+
     def parse_uci(self, uci: str) -> int:
         """Return the packed move for a UCI string, inferring flags from the board."""
         from_square = SQUARE_120_FROM_64[chess.parse_square(uci[0:2])]
@@ -1287,7 +1299,7 @@ def finish_python_chess_score(board: chess.Board, mg_score: int, eg_score: int,
     return score
 
 
-def terminal_score(board: chess.Board):
+def terminal_score(board: chess.Board) -> int | None:
     """Return the finished-game score from White's view, or None if play goes on."""
     has_move = False
     for move in board.generate_legal_moves():
@@ -1376,11 +1388,6 @@ def python_chess_move_delta(board: chess.Board, move: chess.Move) -> tuple:
     return mg_delta, eg_delta, phase_delta
 
 
-def fen_position_key(board: chess.Board):
-    """Return the first four FEN fields as a position key."""
-    return book_key(board)
-
-
 def detect_transposition_key() -> bool:
     """Return True if python-chess offers its private transposition key."""
     try:
@@ -1399,11 +1406,12 @@ def detect_transposition_key() -> bool:
 USE_TRANSPOSITION_KEY = detect_transposition_key()
 
 
-def position_key(board: chess.Board):
+def position_key(board: chess.Board) -> tuple | str:
     """Return a hashable key identifying the position for Core A."""
     if USE_TRANSPOSITION_KEY:
         return board._transposition_key()
-    return fen_position_key(board)
+    # The first four FEN fields identify a position when the private key is unavailable.
+    return book_key(board)
 
 
 def encode_chess_move(move: chess.Move) -> int:
@@ -1594,13 +1602,15 @@ class MailboxEngine:
                     if delta > ASPIRATION_MAX_DELTA:
                         alpha = -INFINITY_SCORE
                         beta = INFINITY_SCORE
+                    # Re-search the fail-high move first, so a timeout cannot fall back
+                    # to a move it already beat.
+                    ordered.remove(self.fail_high_move)
+                    ordered.insert(0, self.fail_high_move)
                     continue
                 break
             if aborted:
                 if self.iteration_move:
                     best_move = self.iteration_move
-                elif self.fail_high_move:
-                    best_move = self.fail_high_move
                 break
             score_dropped = (previous_score is not None
                              and score <= previous_score - SCORE_DROP_MARGIN)
@@ -1657,7 +1667,12 @@ class MailboxEngine:
             raise SearchTimeout()
         board = self.board
         pv_node = beta - alpha > 1
-        if board.halfmove >= 100 or board.is_repetition() or board.is_insufficient_material():
+        if board.halfmove >= 100:
+            # The judge scores checkmate before the fifty-move rule.
+            if in_check and not board.has_legal_move():
+                return ply - MATE_VALUE
+            return self.draw_score(ply)
+        if board.is_repetition() or board.is_insufficient_material():
             return self.draw_score(ply)
         if ply >= MAX_PLY:
             return board.evaluate()
@@ -2052,7 +2067,12 @@ class PythonChessEngine:
             raise SearchTimeout()
         board = self.board
         halfmove = board.halfmove_clock
-        if halfmove >= 100 or self.is_repetition(halfmove) or python_chess_insufficient(board):
+        if halfmove >= 100:
+            # The judge scores checkmate before the fifty-move rule.
+            if in_check and board.is_checkmate():
+                return ply - MATE_VALUE
+            return self.draw_score(ply)
+        if self.is_repetition(halfmove) or python_chess_insufficient(board):
             return self.draw_score(ply)
         if ply >= MAX_PLY:
             return self.static_eval(mg_score, eg_score, phase)
@@ -2321,7 +2341,7 @@ class GameState:
         self.core_b_enabled = False
         return False
 
-    def book_move(self, ply: int, legal_moves: list):
+    def book_move(self, ply: int, legal_moves: list) -> str | None:
         """Return a weighted-random book move, or None once the game leaves the book."""
         if not self.book_active or ply >= BOOK_MAX_PLY:
             return None
