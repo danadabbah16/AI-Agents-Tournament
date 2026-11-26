@@ -1,7 +1,9 @@
 """Battleship agent: per-ship HMM filter for unhit ships, exact hypothesis tracking for hit ships,
 Bayesian sonar, model averaging over placement styles, shadow-opponent model for hiding moves."""
 import random
+import sys
 import time
+import traceback
 
 import numpy as np
 
@@ -538,9 +540,24 @@ class Agent:
 _AGENT = None
 
 
+def _fallback_shot(observation):
+    """Random cell not shot yet, so an internal error costs one weak turn instead of the game."""
+    n = observation["board_size"]
+    shot = {tuple(s["target"]) for s in observation["my_shots"]}
+    open_cells = [(r, c) for r in range(n) for c in range(n) if (r, c) not in shot]
+    r, c = random.choice(open_cells or [(0, 0)])
+    return {"shot": [r, c]}
+
+
 def act(observation):
     global _AGENT
-    if observation["phase"] == "placement":
-        _AGENT = Agent(observation)
-        return _AGENT.placement()
-    return _AGENT.act(observation)
+    try:
+        if observation["phase"] == "placement":
+            _AGENT = Agent(observation)
+            return _AGENT.placement()
+        return _AGENT.act(observation)
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        if observation["phase"] == "placement":
+            return {"placements": None}
+        return _fallback_shot(observation)
