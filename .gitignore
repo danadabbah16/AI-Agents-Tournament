@@ -2,4 +2,3 @@ __pycache__/
 *.pyc
 .idea/
 q_table_line.py
-test_part3.py
