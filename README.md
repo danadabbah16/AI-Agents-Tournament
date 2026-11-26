@@ -15,7 +15,7 @@
 |---|---|---|
 | Road Trip | UCS; A\* (Haversine); Dijkstra distance table; iterated local search (2-opt, Or-opt, double-bridge); A\* with exact heuristic for no-repeat paths; cheapest insertion; large-neighbourhood search with simulated annealing | `ucs`, `astar`, `local_search`, `solve`, `path_avoiding`, `best_insert`, `ruin_and_recreate` in `roadtrip_agent.py` |
 | Chess | Minimax and alpha-beta (required); PeSTO tapered evaluation; iterative deepening with principal variation search, quiescence, transposition table, killers and history; null-move pruning, late move reductions, futility pruning and aspiration windows in the mailbox core; opening book; time manager | `evaluate`, `minimax`, `alphabeta`, `act`, `PythonChessEngine`, `MailboxEngine` in `chess_agent.py` |
-| Battleship | | `battleship_agent.py` |
+| Battleship | Factorised HMM belief filter; exact joint hypothesis tracking with backtracking; Bayesian sonar updates & scan selection; model averaging over placement styles; dual-shadow opponent hiding model; adaptive time manager | `consistent_placements`, `sonar_posterior`, `predict_ship_belief`, `Belief`, `Agent`, `act` in `battleship_agent.py` |
 | Catan | Priority heuristic (baseline); goal-directed planner; Q-learning | `heuristic_policy`, `smart_policy`, `act`, `state_features`, `q_update`, `action_value` in `catan_agent.py` |
 
 ## Training
@@ -54,14 +54,24 @@
 - Move generator: perft exact on 5 reference positions; in 300 random games (58,696 positions) its legal moves equal python-chess's at every ply
 - Unit tests: `pytest tests/test_chess_agent.py` (42 tests, not submitted)
 
-Other challenges: fill in rivals, game counts, and `check_requirements` output.
+**Battleship**
+
+- `check_requirements` (RPC): **3/3** (`consistent_placements` 4/4, `sonar_posterior` 3/3, `predict_ship_belief` worst diff `6.94e-18`)
+- Baseline (`bots/battleship_agent.py`) vs `demo_a` / `demo_b`: **25/30** and **26/30**
+- Original Nikita agent vs 13 opponent types (1,300 games): **1,190 / 1,300 (91.5%)**, including `96/100` vs `demo_a`, `100/100` vs `demo_b`, `92/100` vs baseline
+- Improved final agent:
+  - vs baseline (`bots/battleship_agent.py`, 300 games): **269 wins, 30 losses, 1 draw (89.7%)**
+  - vs original Nikita agent (300 games): **184 wins, 115 losses, 1 draw (61.3%)**
+  - vs edge-biased density hunter (`dens_edge`, 100 games): **85/100** (up from `52/100`)
+  - Subprocess real-clock tests (10 games each vs `demo_a`, `demo_b`, baseline): **30/30** wins, **0** incidents, min clock left `4.47 s` of `5 s`
 
 ## Dependencies and known limitations
 
 Standard library only in our Catan and Road Trip agents.  
 Catan: dice luck; small Q-state (no full board); 5s clock so no deep search.  
 Road Trip: not always optimal (3 of 400 unseen draws, 7–55 km above the optimum); no exact solver fits in 5 s of pure Python.  
-Chess: python-chess 1.11.2 only, Python 3.10 or newer; pure-Python search reaches depth 4–6 in about 0.1 s on a laptop, less on Colab; no full static exchange evaluation.
+Chess: python-chess 1.11.2 only, Python 3.10 or newer; pure-Python search reaches depth 4–6 in about 0.1 s on a laptop, less on Colab; no full static exchange evaluation.  
+Battleship: `numpy` only; shadow assumes the rival shoots its highest-probability cell when missing, so unusual search patterns weaken hiding (never harmful).
 
 ## Technical explanation
 
@@ -238,11 +248,41 @@ Both v2 and v3 also won 20 of 20 games against `demo_A`. Depth reached and nodes
 - Very long games get little thinking time: each move spends a share of what is left, so past roughly ply 150 the clock is near the reserve and endgames are searched at depth 2 or less.
 
 ### Battleship
-*(owner)*
+*(Nikita, Gabi)*
+
+#### Problem formulation
+Two-player partial-information game on a 10 × 10 grid with 5 ships (lengths 5, 4, 3, 3, 2; 17 segments total). Unlike classic Battleship, unhit ships may move 1 cell orthogonally per turn, so old misses lose certainty over time; once hit, a ship becomes immobile. Each turn the agent may optionally move one unhit ship and either shoot a cell or use one of 2 noisy sonar scans (80% exact, ±1 otherwise over a 3 × 3 region). Total clock: 5 s per player, up to 150 rounds.
+
+#### Algorithms
+All code is in `battleship_agent.py` (developed in `bots/battleship_agent_nikita.py`), using `numpy` and the standard library.
+
+| Component | Function / Class | What it does |
+|---|---|---|
+| Required functions | `consistent_placements`, `sonar_posterior`, `predict_ship_belief` | CSP placement enumeration, exact Bayes sonar update, and HMM transition step |
+| Hunting (unhit ships) | `Belief.u`, `Belief.predict`, `Belief.coverage` | Factorised 10 × 10 HMM per length × orientation (`MOVE_RATE = 0.05` split across expected mobile ships) |
+| Targeting (hit ships) | `Belief.hyps`, `Belief._rebuild`, `Belief._history_allows` | Exact joint hypotheses `(L, r, c, o)` for immobile hit ships (capped at 300), with backtracking reconstruction if pruned |
+| Style robustness | `PRIOR_MODELS` in `Agent` | Model averaging across 4 placement priors (uniform, edge-heavy, center-heavy, clustered) weighted by observation likelihood |
+| Sonar | `Belief.sonar`, `Agent._sonar_choice` | Exact convolution + `sonar_posterior` update; scans only when best shot `< 0.20` and expected post-scan best beats `1.5×` current best |
+| Hiding | `Agent._sync_shadow`, `Agent._hide` | Dual-shadow opponent models (uniform + edge-biased) tracking our fleet; picks move minimizing cubed shadow risk with anti-reverse penalty |
+
+#### Baseline against improved version
+
+| Version | Key features | Result |
+|---|---|---|
+| Baseline (`bots/battleship_agent.py`) | Per-ship HMM, CSP hit clusters, simple heuristic move, MI sonar | `25/30` vs `demo_a`, `26/30` vs `demo_b` |
+| Nikita v1 | Exact joint hypotheses, model averaging, single shadow hiding, time manager | `1,190/1,300` (91.5%) across 13 opponents; `92/100` vs baseline; `52/100` vs `dens_edge` |
+| Final | + edge-weighted placement, dual shadow (uniform + edge), anti-reverse penalty, active-length skip | **269/300 (89.7%)** vs baseline; **184/300 (61.3%)** vs Nikita v1; **85/100** vs `dens_edge` |
+
+#### Time and memory
+`TIME_RESERVE = 0.6 s` is never spent. Turns are "rich" (full hiding, sonar, all models) while spare time exceeds `rounds_left * 0.008 s + 3 * turn_cost`, using a runtime moving average of `turn_cost` to adapt to slower machines. Cheap turns keep only the top placement model and skip shadow/sonar (~8 ms/turn). In subprocess tests, minimum clock remaining was `4.47 s` of `5 s`.
+
+#### Limits
+- The shadow assumes the opponent shoots its highest-probability cell when missing; unconventional search patterns reduce hiding gains (though moves are only taken when they lower estimated risk).
+- Assumes a low uniform enemy move rate (`MOVE_RATE = 0.05`) rather than estimating movement frequency online.
 
 ## Use of generative AI
 
 Catan: used coding assistants for drafting/debugging. We can explain all algorithms ourselves.  
 Road Trip: used Claude Code (Anthropic) to help write, test and benchmark the agent and to draft its explanation.  
 Chess: the plan and the code were produced with AI assistance (Claude). The team reviewed and tested the code, and is responsible for it.  
-Other members: add your note here.
+Battleship: used AI coding assistants for drafting, benchmarking, and documentation. The team reviewed all code and can explain every algorithm.
