@@ -97,9 +97,24 @@ def useful_trade(actions, resources):
 
 def act(observation):
     try:
-        return {"action": heuristic_policy(observation)}
+        return {"action": learned_policy(observation)}
     except Exception:
         return {"action": observation["actions"][0]["id"]}
+
+
+def learned_policy(observation):
+    """v2: choose the action TYPE with the highest learned Q, then the best action of that type.
+
+    Falls back to the baseline when there is nothing to choose between, or when
+    the table does not know every option in this state.
+    """
+    kinds = sorted({a["type"] for a in observation["actions"]})
+    if len(kinds) < 2 or observation.get("phase") == "initial_placement":
+        return heuristic_policy(observation)
+    if any(q_key(observation, kind) not in Q for kind in kinds):
+        return heuristic_policy(observation)
+    best = max(kinds, key=lambda kind: Q[q_key(observation, kind)])
+    return pick_of_type(observation, best)["id"]
 
 
 def heuristic_policy(observation):
@@ -160,18 +175,11 @@ def state_features(observation):
 
 
 def action_value(observation, action_id):
-    """Estimate of how good this action is."""
-    actions = observation["actions"]
-    action = next((a for a in actions if a["id"] == action_id), None)
+    """Learned Q value of this action's type in this state (0.0 if never learned)."""
+    action = next((a for a in observation["actions"] if a["id"] == action_id), None)
     if action is None:
         return 0.0
-    try:
-        if action_id == heuristic_policy(observation):
-            return 10.0
-    except Exception:
-        pass
-    rank = {kind: len(PRIORITY) - i for i, kind in enumerate(PRIORITY)}
-    return float(rank.get(action["type"], 0))
+    return float(Q.get(q_key(observation, action["type"]), 0.0))
 
 
 def q_update(q, reward, best_next_q, alpha, gamma):
