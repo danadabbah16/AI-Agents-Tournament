@@ -148,21 +148,15 @@ def heuristic_policy(observation):
 
 
 def state_features(observation):
-    """Short list describing the state. Must be deterministic."""
+    """Small abstraction of the state, so a table can cover it. Must be deterministic."""
     me = observation["me"]
     opp = observation["opponent"]
-    return [
-        observation.get("phase"),
-        me.get("victory_points", me.get("visible_victory_points", 0)),
-        opp.get("visible_victory_points", 0),
-        me.get("resource_cards", 0),
-        len(me.get("settlements", [])),
-        len(me.get("cities", [])),
-        me.get("longest_road_length", 0),
-        me.get("played_development_cards", {}).get("KNIGHT", 0),
-        int(me.get("has_longest_road", False)),
-        int(me.get("has_largest_army", False)),
-    ]
+    my_vp = me.get("victory_points", me.get("visible_victory_points", 0))
+    lead = my_vp - opp.get("visible_victory_points", 0)
+    lead = max(-2, min(2, lead))
+    cards = me.get("resource_cards", 0)
+    hand = 0 if cards <= 3 else (1 if cards <= 7 else 2)  # 8+ risks the discard on a 7
+    return [observation.get("phase"), my_vp, lead, hand]
 
 
 def action_value(observation, action_id):
@@ -183,3 +177,30 @@ def action_value(observation, action_id):
 def q_update(q, reward, best_next_q, alpha, gamma):
     """Q-learning update rule."""
     return q + alpha * (reward + gamma * best_next_q - q)
+
+
+
+def q_key(observation, kind):
+    """Table key: the abstract state plus the TYPE of action (ids change every turn)."""
+    return str(tuple(state_features(observation))) + "|" + kind
+
+
+def pick_of_type(observation, kind):
+    """The concrete action of this type that the baseline's helpers prefer."""
+    actions = observation["actions"]
+    board = observation["board"]
+    if kind == "BUILD_SETTLEMENT":
+        return best_settlement(actions, board)
+    if kind == "BUILD_CITY":
+        return best_city(actions, board)
+    if kind == "MOVE_ROBBER":
+        return best_robber([a for a in actions if a["type"] == kind])
+    if kind == "MARITIME_TRADE":
+        trade = useful_trade(actions, observation["me"].get("resources", {}))
+        if trade is not None:
+            return trade
+    return first_of_type(actions, kind)
+
+
+# Learned offline by train_catan.py. Empty until Part 5.
+Q = {}
