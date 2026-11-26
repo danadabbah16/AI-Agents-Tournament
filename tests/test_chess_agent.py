@@ -392,3 +392,75 @@ def test_core_b_is_disabled_on_root_mismatch() -> None:
     assert not chess_agent.STATE.core_b_enabled
     observation["ply"] = 30
     assert chess_agent.act(observation)["move"] in observation["legal_moves"]
+
+
+class TimeoutAfterFailHigh(chess_agent.MailboxEngine):
+    """Core B engine that times out one move into the re-search after a root fail-high."""
+
+    def __init__(self, board: chess_agent.MailboxBoard) -> None:
+        """Start unarmed; arm on the first root fail-high by a move other than the first."""
+        super().__init__(board)
+        self.armed = False
+        self.fail_high_seen = 0
+
+    def search_root_moves(self, ordered: list, depth: int, alpha: int, beta: int) -> tuple:
+        """Search normally until a fail-high, then search one move and raise a timeout."""
+        if self.armed:
+            board = self.board
+            mover = board.side
+            board.make_move(ordered[0])
+            gives_check = board.is_attacked(board.king_squares[mover ^ 1], mover)
+            score = -self.search_node(depth - 1, -beta, -alpha, 1, gives_check, True)
+            board.unmake_move()
+            if score > alpha:
+                self.iteration_move = ordered[0]
+            raise chess_agent.SearchTimeout()
+        score, move = super().search_root_moves(ordered, depth, alpha, beta)
+        if score >= beta and beta < chess_agent.INFINITY_SCORE and move != ordered[0]:
+            self.armed = True
+            self.fail_high_seen = move
+        return score, move
+
+
+def test_timeout_during_aspiration_re_search_keeps_fail_high_move() -> None:
+    generator = random.Random(3)
+    checked = 0
+    for game in range(300):
+        board = chess.Board()
+        for ply in range(generator.randint(10, 60)):
+            moves = list(board.legal_moves)
+            if not moves:
+                break
+            board.push(generator.choice(moves))
+        if board.is_game_over():
+            continue
+        mailbox = mailbox_from_fen(board.fen())
+        engine = TimeoutAfterFailHigh(mailbox)
+        move, score, depth = engine.think(10.0, 10.0, 5, time.perf_counter())
+        if engine.armed:
+            assert move == engine.fail_high_seen
+            assert mailbox.matches(board)
+            checked += 1
+            if checked >= 5:
+                break
+    assert checked >= 3
+
+
+FIFTY_MOVE_MATE_FEN = "6k1/5ppp/8/8/8/8/8/R5K1 w - - 99 120"
+
+
+@pytest.mark.parametrize("core", ["A", "B"])
+def test_mate_on_the_hundredth_halfmove_beats_the_draw(core: str) -> None:
+    board = chess.Board(FIFTY_MOVE_MATE_FEN)
+    start = time.perf_counter()
+    if core == "B":
+        engine = chess_agent.MailboxEngine(mailbox_from_fen(FIFTY_MOVE_MATE_FEN))
+        move, score, depth = engine.think(1.0, 1.0, 3, start)
+        uci = chess_agent.move_to_uci(move)
+    else:
+        engine = chess_agent.PythonChessEngine()
+        keys = [chess_agent.position_key(board)]
+        move, score, depth = engine.think(board, keys, 1.0, 1.0, 3, start)
+        uci = move.uci()
+    assert uci == "a1a8"
+    assert score == chess_agent.MATE_VALUE - 1

@@ -1114,6 +1114,18 @@ class MailboxBoard:
             self.unmake_move()
         return legal
 
+    def has_legal_move(self) -> bool:
+        """Return True as soon as one legal move is found."""
+        side = self.side
+        enemy = side ^ 1
+        for move in self.generate_moves(False):
+            self.make_move(move)
+            legal = not self.is_attacked(self.king_squares[side], enemy)
+            self.unmake_move()
+            if legal:
+                return True
+        return False
+
     def parse_uci(self, uci: str) -> int:
         """Return the packed move for a UCI string, inferring flags from the board."""
         from_square = SQUARE_120_FROM_64[chess.parse_square(uci[0:2])]
@@ -1590,13 +1602,15 @@ class MailboxEngine:
                     if delta > ASPIRATION_MAX_DELTA:
                         alpha = -INFINITY_SCORE
                         beta = INFINITY_SCORE
+                    # Re-search the fail-high move first, so a timeout cannot fall back
+                    # to a move it already beat.
+                    ordered.remove(self.fail_high_move)
+                    ordered.insert(0, self.fail_high_move)
                     continue
                 break
             if aborted:
                 if self.iteration_move:
                     best_move = self.iteration_move
-                elif self.fail_high_move:
-                    best_move = self.fail_high_move
                 break
             score_dropped = (previous_score is not None
                              and score <= previous_score - SCORE_DROP_MARGIN)
@@ -1653,7 +1667,12 @@ class MailboxEngine:
             raise SearchTimeout()
         board = self.board
         pv_node = beta - alpha > 1
-        if board.halfmove >= 100 or board.is_repetition() or board.is_insufficient_material():
+        if board.halfmove >= 100:
+            # The judge scores checkmate before the fifty-move rule.
+            if in_check and not board.has_legal_move():
+                return ply - MATE_VALUE
+            return self.draw_score(ply)
+        if board.is_repetition() or board.is_insufficient_material():
             return self.draw_score(ply)
         if ply >= MAX_PLY:
             return board.evaluate()
@@ -2048,7 +2067,12 @@ class PythonChessEngine:
             raise SearchTimeout()
         board = self.board
         halfmove = board.halfmove_clock
-        if halfmove >= 100 or self.is_repetition(halfmove) or python_chess_insufficient(board):
+        if halfmove >= 100:
+            # The judge scores checkmate before the fifty-move rule.
+            if in_check and board.is_checkmate():
+                return ply - MATE_VALUE
+            return self.draw_score(ply)
+        if self.is_repetition(halfmove) or python_chess_insufficient(board):
             return self.draw_score(ply)
         if ply >= MAX_PLY:
             return self.static_eval(mg_score, eg_score, phase)
