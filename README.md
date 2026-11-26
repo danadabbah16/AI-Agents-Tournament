@@ -52,7 +52,7 @@
 - Self-play, 50 games at 5 s and 50 at 10 s: **0** illegal moves, crashes or time losses; lowest clock left 0.48 s
 - Final (Core B) against Core A alone: 17 wins, 1 draw, 2 losses over 20 games
 - Move generator: perft exact on 5 reference positions; in 300 random games (58,696 positions) its legal moves equal python-chess's at every ply
-- Unit tests: `pytest tests/test_chess_agent.py` (39 tests, not submitted)
+- Unit tests: `pytest tests/test_chess_agent.py` (42 tests, not submitted)
 
 Other challenges: fill in rivals, game counts, and `check_requirements` output.
 
@@ -61,7 +61,7 @@ Other challenges: fill in rivals, game counts, and `check_requirements` output.
 Standard library only in our Catan and Road Trip agents.  
 Catan: dice luck; small Q-state (no full board); 5s clock so no deep search.  
 Road Trip: not always optimal (3 of 400 unseen draws, 7–55 km above the optimum); no exact solver fits in 5 s of pure Python.  
-Chess: python-chess 1.11.2 only; pure-Python search reaches depth 4–6 in about 0.1 s on a laptop, less on Colab; no full static exchange evaluation.
+Chess: python-chess 1.11.2 only, Python 3.10 or newer; pure-Python search reaches depth 4–6 in about 0.1 s on a laptop, less on Colab; no full static exchange evaluation.
 
 ## Technical explanation
 
@@ -294,7 +294,7 @@ Both v2 and v3 also won 20 of 20 games against `demo_A`. Depth reached and nodes
 
 - 0.5 s of the clock is always kept in reserve.
 - Soft limit = usable time / moves to go (at least 18), ×1.3 in check, ×1.2 before ply 24.
-- Hard limit = min(3 × soft, 20% of usable time). The clock is read every 64 nodes and the search aborts at the hard limit, keeping the best move of the last completed iteration.
+- Hard limit = min(3 × soft, 20% of usable time). The clock is read every 64 nodes and the search aborts at the hard limit. It keeps the best move of the last completed iteration, unless a move in the unfinished one already proved better (a move that failed high in an aspiration window is re-searched first, so a timeout never falls back to a move it beat).
 - No new iteration starts after half of the soft limit (half of the hard limit when the score just dropped by 40 cp or more).
 - Under 0.6 s (panic): depth 2, and at most 0.02 s or 5% of the time above 0.25 s per move, so the last quarter second is never spent on search. Under 0.25 s: no search at all.
 - Every limit is a fraction of `time_remaining_s`, so a 10 s clock scales automatically.
@@ -305,7 +305,7 @@ Both v2 and v3 also won 20 of 20 games against `demo_A`. Depth reached and nodes
 - Pure Python: depth 4 to 6 in about 0.1 s on a laptop, less on Colab.
 - Repetition inside the search counts after two occurrences, a deliberate simplification.
 - No full static exchange evaluation; losing captures are guessed from pawn defence only.
-- The 50-move rule is checked before mate detection.
+- Very long games get little thinking time: each move spends a share of what is left, so past roughly ply 150 the clock is near the reserve and endgames are searched at depth 2 or less.
 
 ### Battleship
 *(owner)*
